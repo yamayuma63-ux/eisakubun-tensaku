@@ -330,18 +330,25 @@ function getFallbackProblems(elements) {
   });
 }
 
-// Topic単位(Phase 4: Today's Five/Support)向けの予備問題。
+// Topic単位(Phase 4: Today's Five/Support、Phase 5: Final Check)向けの予備問題。
 // FALLBACK_PROBLEMS(講単位)の中から、そのTopicのsourceExamplesに含まれる和文だけを抽出して使う
 // (Phase 2.5で既にTopicへ整理済みのデータをそのまま再利用。新規コンテンツの作成なし)。
-function getFallbackProblemsForTopics(elements) {
+// avoidJapanese(Phase 5で追加): 直近のFinal Check試行で使用済みの和文。未使用候補が足りる限りは避け、
+// 足りない場合のみ最終手段として再利用する。省略時(Today's Five/Support等)は従来通りの挙動。
+function getFallbackProblemsForTopics(elements, avoidJapanese = []) {
+  const avoid = avoidJapanese || [];
   const used = {};
   return elements.map(el => {
     const topic = TOPIC_MAP[el.id];
     const pool = topic ? (FALLBACK_PROBLEMS[topic.lessonId] || []).filter(p => topic.sourceExamples.includes(p.japanese)) : [];
     const bank = pool.length > 0 ? pool : [{ japanese: `(${el.label}を使った文を作って訳してください)`, modelAnswer: "" }];
-    const idx = (used[el.id] || 0) % bank.length;
-    used[el.id] = (used[el.id] || 0) + 1;
-    return { elementId: el.id, japanese: bank[idx].japanese, modelAnswer: bank[idx].modelAnswer };
+    const freshPool = avoid.length > 0 ? bank.filter(p => !avoid.includes(p.japanese)) : bank;
+    const avoidedPool = avoid.length > 0 ? bank.filter(p => avoid.includes(p.japanese)) : [];
+    const ordered = freshPool.concat(avoidedPool); // 未使用を優先し、尽きた場合のみ使用済みを最終手段として再利用する
+    const i = used[el.id] || 0;
+    used[el.id] = i + 1;
+    const picked = ordered[i % ordered.length];
+    return { elementId: el.id, japanese: picked.japanese, modelAnswer: picked.modelAnswer };
   });
 }
 
@@ -1656,7 +1663,7 @@ function App() {
       setFinalCheckSession({ lessonId, stage: "answering", problems, usedFallback: false, classificationList });
     } catch (e) {
       console.error("generateFinalCheckProblems failed, using fallback bank", e);
-      const problems = getFallbackProblemsForTopics(elements).map(p => ({ ...p, userAnswer: "" }));
+      const problems = getFallbackProblemsForTopics(elements, avoidJapanese).map(p => ({ ...p, userAnswer: "" }));
       setFinalCheckSession({ lessonId, stage: "answering", problems, usedFallback: true, classificationList });
       setDrillWarning("AIによる問題生成が一時的にできなかったため、予備の問題セットを表示しています。");
     }
@@ -1676,6 +1683,9 @@ function App() {
     setDrillError("");
     try {
       const graded = await gradeFinalCheckAnswers(finalCheckSession.problems, finalCheckSession.classificationList);
+      if (!Array.isArray(graded) || graded.length !== finalCheckSession.problems.length) {
+        throw new Error("grading count mismatch: expected " + finalCheckSession.problems.length + ", got " + (graded && graded.length));
+      }
       const capped = graded.map(g => capFinalCheckScore(g));
       const problems = finalCheckSession.problems.map((p, i) => ({
         ...p,
