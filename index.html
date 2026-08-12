@@ -604,6 +604,191 @@ function unlockNextLessonIfNeeded(lessonStates, currentLessonId) {
   return { lessonStates: updated, nextLessonId: next.lessonId, isLastLesson: false };
 }
 
+// ---------- Phase 7: WEAKNESS ENGINE (MASTER_SPEC PART 10) ----------
+// 独立したlocalStorageキー(weaknesses)に保存する、アプリ横断のWeakness DB。
+// drillStateには一切追加しない。Today/Support/FinalCheck/Weekly/FreeWritingから共通利用する。
+// AIはerrorType(有限taxonomyから選択)とerrorPattern(machine-readable canonical key)のみを返し、
+// Weaknessの存在判定・重要度判定・状態更新はすべてアプリ側の決定的ロジックで行う。
+
+// errorType → category の固定導出テーブル。現在検出可能な15項目 + 将来Phase向けの予約9項目。
+const ERROR_TYPE_TAXONOMY = {
+  "verb-tense": { category: "grammar", label: "時制" },
+  "verb-form": { category: "grammar", label: "動詞の形(原形/ing/過去分詞等)" },
+  "subject-verb-agreement": { category: "grammar", label: "主語と動詞の一致" },
+  "article-usage": { category: "grammar", label: "冠詞" },
+  "preposition-choice": { category: "grammar", label: "前置詞選択" },
+  "passive-voice": { category: "grammar", label: "受動態の形成" },
+  "relative-clause": { category: "grammar", label: "関係詞" },
+  "conditional-form": { category: "grammar", label: "仮定法・条件文" },
+  "comparison-form": { category: "grammar", label: "比較表現の形" },
+  "word-order": { category: "grammar", label: "語順" },
+  "conjunction-usage": { category: "grammar", label: "接続詞の使い方" },
+  "verb-pattern": { category: "usage", label: "動詞の型(自他動詞・目的語パターン)" },
+  "noun-countability": { category: "usage", label: "可算・不可算の扱い" },
+  "fixed-expression": { category: "usage", label: "定型構文の型" },
+  "collocation-mismatch": { category: "collocation", label: "語の組み合わせ" },
+  // 予約(将来Phase向け。現在のAI関数からは選択肢として提示しない)
+  "word-choice": { category: "vocabulary", label: "語彙選択" },
+  "register-mismatch": { category: "vocabulary", label: "文体・フォーマル度" },
+  "paraphrase-inaccuracy": { category: "paraphrase", label: "言い換えの精度" },
+  "reasoning-gap": { category: "logic", label: "論理展開の欠落" },
+  "topic-drift": { category: "logic", label: "題意逸脱" },
+  "paragraph-structure": { category: "structure", label: "段落構成" },
+  "missing-element": { category: "structure", label: "構成要素の欠落" },
+  "cohesion-connector": { category: "cohesion", label: "文/段落間のつながり" },
+  "repetition-overlap": { category: "cohesion", label: "論点の重複" },
+};
+// AIへ選択肢として提示するのはこの15項目のみ(検出経路が存在する範囲に限定)。
+const ACTIVE_ERROR_TYPES = [
+  "verb-tense", "verb-form", "subject-verb-agreement", "article-usage", "preposition-choice",
+  "passive-voice", "relative-clause", "conditional-form", "comparison-form", "word-order",
+  "conjunction-usage", "verb-pattern", "noun-countability", "fixed-expression", "collocation-mismatch",
+];
+// 採点プロンプトに共通で埋め込むerrorType/errorPatternの指示ブロック(3つのAI関数で共用)。
+const ERROR_TYPE_PROMPT_BLOCK = `誤りがある場合は、その原因を次の分類(errorType)から1つ選んでください(正解の場合や分類できない場合はnull):
+${ACTIVE_ERROR_TYPES.map(k => `${k}: ${ERROR_TYPE_TAXONOMY[k].label}`).join(" / ")}
+
+さらに、errorPatternとして、そのミスの具体的な原因パターンを表す短い機械可読なキーを生成してください。
+- 小文字の英数字とハイフンのみ(例: discuss-about, make-object-to-infinitive, missing-article-singular-countable)
+- 説明文ではなく、再発可能な原因パターンそのものを表すこと(表面的な文そのものの言い換えではない)
+- 同じ原因のミスには必ず同じキーを返すこと
+- 該当なし・正解の場合はnull`;
+
+// 発生源(sourceType)ごとの重要度。Weakness登録の対象はこのマップに存在するsourceTypeのみ。
+const OCCURRENCE_SEVERITY = {
+  finalCheckRemedial: 4, finalCheck: 3, freeWriting: 3, weeklyRemedial: 3, weekly: 2, support: 1,
+};
+const WEAKNESS_REGISTERED_SOURCE_TYPES = Object.keys(OCCURRENCE_SEVERITY);
+const WEAKNESS_MAX_COUNT = 200;
+const WEAKNESS_OCCURRENCE_CAP = 10;
+
+// errorPatternの正規化・validation。不正・過度に長い場合はnullを返し、呼び出し側でフォールバックさせる。
+function normalizeErrorPattern(raw) {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return null;
+  if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(trimmed)) return null;
+  if (trimmed.length < 3 || trimmed.length > 60) return null;
+  return trimmed;
+}
+
+function resolveErrorTypeCategory(errorType) {
+  const entry = ERROR_TYPE_TAXONOMY[errorType];
+  return entry ? entry.category : null;
+}
+
+// weaknessIdの決定的生成。errorPatternが有効ならそれを軸に、無効/欠損ならtopicIdへフォールバック。
+// どちらも得られない場合はnullを返し、呼び出し側は登録をスキップする。
+function computeWeaknessId({ category, errorType, errorPattern, topicId, lessonId }) {
+  const normalizedPattern = normalizeErrorPattern(errorPattern);
+  if (normalizedPattern) return `wk-${category}-${errorType}-${normalizedPattern}`;
+  // topicIdを最優先、Topic粒度を持たない発生源(週次演習・自由英作文はlessonIdのみ)はlessonIdへフォールバックする。
+  const fallbackRef = topicId || lessonId;
+  if (fallbackRef) return `wk-${category}-${fallbackRef}-${errorType}`;
+  return null;
+}
+
+// 200件を超えた場合、severityが最も低く、かつlastSeenAtが最も古いものから削除する。
+function pruneWeaknesses(weaknesses) {
+  const ids = Object.keys(weaknesses);
+  if (ids.length <= WEAKNESS_MAX_COUNT) return weaknesses;
+  const sorted = ids.map(id => weaknesses[id]).sort((a, b) => {
+    if (a.severity !== b.severity) return a.severity - b.severity;
+    return new Date(a.lastSeenAt) - new Date(b.lastSeenAt);
+  });
+  const toRemove = sorted.slice(0, ids.length - WEAKNESS_MAX_COUNT).map(w => w.weaknessId);
+  const next = { ...weaknesses };
+  toRemove.forEach(id => delete next[id]);
+  return next;
+}
+
+// 1件のミス発生をWeakness DBへ登録する純関数(不変更新)。taxonomy外・登録対象外sourceType・
+// weaknessId生成不可のいずれかに該当する場合は、weaknessesを変更せずそのまま返す。
+function registerWeaknessOccurrence(weaknesses, input) {
+  const { sourceType, errorType, errorPattern, topicId, lessonId, originalSentence, correctedSentence, explanation, ts } = input;
+  if (!WEAKNESS_REGISTERED_SOURCE_TYPES.includes(sourceType)) return weaknesses;
+  if (!errorType || !ERROR_TYPE_TAXONOMY[errorType]) return weaknesses;
+  const category = resolveErrorTypeCategory(errorType);
+  const weaknessId = computeWeaknessId({ category, errorType, errorPattern, topicId, lessonId });
+  if (!weaknessId) return weaknesses;
+
+  const normalizedPattern = normalizeErrorPattern(errorPattern);
+  const occurrenceSeverity = OCCURRENCE_SEVERITY[sourceType] || 1;
+  const nowIso = new Date(ts || Date.now()).toISOString();
+  const occurrenceEntry = {
+    ts: ts || Date.now(), sourceType, severity: occurrenceSeverity,
+    topicId: topicId || null, lessonId: lessonId || null,
+    originalSentence: originalSentence || "", correctedSentence: correctedSentence || "", explanation: explanation || "",
+  };
+
+  const existing = weaknesses[weaknessId];
+  if (!existing) {
+    const wk = {
+      weaknessId, category, errorType, errorPattern: normalizedPattern,
+      topicId: topicId || null, lessonId: lessonId || null,
+      relatedTopicIds: topicId ? [topicId] : [],
+      relatedLessonIds: lessonId ? [lessonId] : [],
+      representativeOriginal: originalSentence || "",
+      representativeCorrected: correctedSentence || "",
+      explanation: explanation || "",
+      severity: occurrenceSeverity,
+      occurrenceCount: 1,
+      sourceTypes: [sourceType],
+      occurrences: [occurrenceEntry],
+      createdAt: nowIso,
+      lastSeenAt: nowIso,
+      // Phase 8専用フィールド。Phase 7では初期化のみ行い、以後一切更新しない。
+      lastReviewedAt: null, nextReviewAt: null, reviewCount: 0, correctCount: 0, masteryLevel: 0,
+    };
+    return pruneWeaknesses({ ...weaknesses, [weaknessId]: wk });
+  }
+
+  const relatedTopicIds = topicId && !existing.relatedTopicIds.includes(topicId)
+    ? [...existing.relatedTopicIds, topicId] : existing.relatedTopicIds;
+  const relatedLessonIds = lessonId && !existing.relatedLessonIds.includes(lessonId)
+    ? [...existing.relatedLessonIds, lessonId] : existing.relatedLessonIds;
+  const sourceTypes = existing.sourceTypes.includes(sourceType) ? existing.sourceTypes : [...existing.sourceTypes, sourceType];
+  const occurrences = [...existing.occurrences, occurrenceEntry].slice(-WEAKNESS_OCCURRENCE_CAP);
+
+  const updated = {
+    ...existing,
+    relatedTopicIds, relatedLessonIds, sourceTypes, occurrences,
+    explanation: explanation || existing.explanation,
+    severity: Math.max(existing.severity, occurrenceSeverity), // occurrenceCountとは独立
+    occurrenceCount: existing.occurrenceCount + 1,
+    lastSeenAt: nowIso,
+    // Phase 8専用フィールドはここでも一切更新しない
+  };
+  return pruneWeaknesses({ ...weaknesses, [weaknessId]: updated });
+}
+
+function registerWeaknessOccurrences(weaknesses, items) {
+  return (items || []).reduce((acc, item) => registerWeaknessOccurrence(acc, item), weaknesses);
+}
+
+// ---------- Weakness DB 専用アクセス層(drill-state等の既存キーとは完全に独立) ----------
+async function loadWeaknesses() {
+  try {
+    const r = await window.storage.get("weaknesses", false);
+    if (r) return JSON.parse(r.value);
+  } catch (e) { console.error("loadWeaknesses failed", e); }
+  return {};
+}
+async function saveWeaknesses(weaknesses) {
+  try {
+    await window.storage.set("weaknesses", JSON.stringify(weaknesses), false);
+  } catch (e) { console.error("saveWeaknesses failed (non-fatal)", e); }
+}
+// 採点完了後、誤答分をまとめてWeakness DBへ登録する(read-modify-writeのベストエフォート副作用)。
+async function recordWeaknessOccurrences(items) {
+  if (!items || items.length === 0) return;
+  try {
+    const current = await loadWeaknesses();
+    const next = registerWeaknessOccurrences(current, items);
+    await saveWeaknesses(next);
+  } catch (e) { console.error("recordWeaknessOccurrences failed (non-fatal)", e); }
+}
+
 // ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
 // 静的コンテンツのみ。AI呼び出し・localStorage・既存UIには一切接続しない(閲覧用データ層のみ)。
 // Grammar系は Phase 2 の LESSONS/Topic と1対1対応。Logic/Vocabularyは講に依存しない独立教材。
@@ -1030,8 +1215,11 @@ async function gradeDrillAnswers(items, classificationList) {
 各設問には対象要素(targetElementId)が設定されていますが、実際に間違えた要素は対象要素と異なる場合もあるので、解答内容から正確に判定してください。
 選べる要素IDと説明は次の通りです:
 ${list.map(e => `${e.id}: ${e.label}`).join("\n")}
+
+${ERROR_TYPE_PROMPT_BLOCK}
+
 以下のJSON配列のみを出力してください。入力と同じ順番・同じ件数で返してください。説明やコードフェンスは付けないでください。
-[{"correct": true/false, "correctedText": "自然な模範解答(誤りがあれば修正した形)", "feedback": "日本語で短い一言フィードバック", "mistakeElementId": "間違えた要素のID。正解の場合はnull"}]`;
+[{"correct": true/false, "correctedText": "自然な模範解答(誤りがあれば修正した形)", "feedback": "日本語で短い一言フィードバック", "mistakeElementId": "間違えた要素のID。正解の場合はnull", "errorType": "分類のキーまたはnull", "errorPattern": "機械可読なキーまたはnull"}]`;
   const payload = items.map((it, i) => ({
     no: i + 1, targetElementId: it.elementId, japanese: it.japanese,
     modelAnswer: it.modelAnswer, userAnswer: it.userAnswer,
@@ -1079,8 +1267,11 @@ async function gradeFinalCheckAnswers(items, classificationList) {
 ${list.map(e => `${e.id}: ${e.label}`).join("\n")}
 
 模範解答と表現が異なっていても、文法的に正しく設問の意図を満たしていれば高く採点してください。自然な別解を文法的誤答として減点しないでください。
+
+${ERROR_TYPE_PROMPT_BLOCK}
+
 以下のJSON配列のみを出力してください。入力と同じ順番・同じ件数で返してください。説明やコードフェンスは付けないでください。
-[{"score": 0-10, "targetSkillAssessment": "used"|"equivalent"|"avoided", "correctedText": "自然な模範解答", "feedback": "日本語で短いコメント"}]`;
+[{"score": 0-10, "targetSkillAssessment": "used"|"equivalent"|"avoided", "correctedText": "自然な模範解答", "feedback": "日本語で短いコメント", "errorType": "分類のキーまたはnull", "errorPattern": "機械可読なキーまたはnull"}]`;
   const payload = items.map((it, i) => ({
     no: i + 1, targetElementId: it.elementId, japanese: it.japanese,
     modelAnswer: it.modelAnswer, userAnswer: it.userAnswer,
@@ -1138,13 +1329,15 @@ async function gradeFreeWrite(theme, essayText) {
 ${CURRICULUM.map(e => `${e.id}: ${e.label}`).join("\n")}
 スペルミスや冠詞の単純な付け忘れなど、瑣末な誤りはminor:trueにしてください。文構造・時制・態・準動詞・関係詞・仮定法など、学習上重要な文法要素の誤りはminor:falseにしてください。
 
+各誤りについて、${ERROR_TYPE_PROMPT_BLOCK}
+
 以下のJSON形式のみを出力してください。説明やコードフェンスは付けないでください。
 {
   "scores": {"achievement": 0-10, "logic": 0-7, "grammar": 0-5, "vocabulary": 0-4, "composition": 0-4},
   "comments": {"achievement": "日本語で短いコメント", "logic": "...", "grammar": "...", "vocabulary": "...", "composition": "..."},
   "overallComment": "全体講評を日本語で2〜4文",
   "modelAnswer": "この設問に対する模範解答の英文",
-  "grammarMistakes": [{"elementId": "要素IDまたはnull", "description": "誤りの内容を日本語で一言", "minor": true/false}]
+  "grammarMistakes": [{"elementId": "要素IDまたはnull", "description": "誤りの内容を日本語で一言", "minor": true/false, "errorType": "分類のキーまたはnull", "errorPattern": "機械可読なキーまたはnull"}]
 }`;
   const clean = await withRetry(() => callClaudeRaw(sys, `設問:\n${theme}\n\n解答:\n${essayText}`, 1400));
   return JSON.parse(clean);
@@ -1518,6 +1711,16 @@ function App() {
       const result = { ...g, rawTotal, cap, finalTotal, mistakeElementIds };
       setFreeWriteSession({ ...freeWriteSession, stage: "result", result });
       recordFreeWriteMistakes(mistakeElementIds);
+      // Phase 7: minor:falseの誤りをWeakness DBへ登録(既存のgrammarMistakes構造をそのまま利用)
+      const weaknessItems = (g.grammarMistakes || [])
+        .filter(m => m.elementId && !m.minor && ELEMENT_MAP[m.elementId])
+        .map(m => ({
+          sourceType: "freeWriting", errorType: m.errorType || null, errorPattern: m.errorPattern || null,
+          topicId: null, lessonId: m.elementId,
+          originalSentence: freeWriteSession.essayText, correctedSentence: "", explanation: m.description || "",
+          ts: Date.now(),
+        }));
+      recordWeaknessOccurrences(weaknessItems);
       const nextState = {
         lastTs: Date.now(),
         usedThemes: [...freeWriteState.usedThemes, { ts: Date.now(), theme: freeWriteSession.theme, source: freeWriteSession.source.key, finalTotal }].slice(-50),
@@ -1695,6 +1898,8 @@ function App() {
         usedTargetSkill: capped[i].usedTargetSkill,
         correctedText: graded[i].correctedText,
         feedback: graded[i].feedback,
+        errorType: graded[i].errorType || null,
+        errorPattern: graded[i].errorPattern || null,
       }));
       const result = computeFinalCheckResult(problems.map(p => p.cappedScore));
       const lessonId = finalCheckSession.lessonId;
@@ -1736,6 +1941,13 @@ function App() {
         japanese: p.japanese, userAnswer: p.userAnswer, score: p.score, cappedScore: p.cappedScore,
         targetSkillAssessment: p.targetSkillAssessment, correct: p.cappedScore >= 7,
       })));
+      // Phase 7: cappedScore<7(要修正)の設問をWeakness DBへ登録
+      const weaknessItems = problems.filter(p => p.cappedScore < 7).map(p => ({
+        sourceType: "finalCheck", errorType: p.errorType, errorPattern: p.errorPattern,
+        topicId: p.elementId, lessonId: TOPIC_MAP[p.elementId] ? TOPIC_MAP[p.elementId].lessonId : null,
+        originalSentence: p.japanese, correctedSentence: p.correctedText, explanation: p.feedback, ts: Date.now(),
+      }));
+      recordWeaknessOccurrences(weaknessItems);
 
       setFinalCheckSession({ ...finalCheckSession, stage: "result", problems, result, isLastLesson: nextInfo.isLastLesson });
     } catch (e) {
@@ -1777,6 +1989,8 @@ function App() {
         correctedText: graded[i].correctedText,
         feedback: graded[i].feedback,
         mistakeElementId: graded[i].mistakeElementId,
+        errorType: graded[i].errorType || null,
+        errorPattern: graded[i].errorPattern || null,
       }));
 
       if (TOPIC_BASED_ROUNDS.includes(session.round)) {
@@ -1809,6 +2023,15 @@ function App() {
           topicId: p.elementId, elementId: p.elementId, japanese: p.japanese,
           userAnswer: p.userAnswer, correct: p.correct, mistakeElementId: p.mistakeElementId,
         })));
+        // Phase 7: Today's Five(新規学習中の初回ミス)は登録しない。Support/finalCheckRemedialのみ登録。
+        if (!isPlanned) {
+          const weaknessItems = problems.filter(p => !p.correct).map(p => ({
+            sourceType: session.round, errorType: p.errorType, errorPattern: p.errorPattern,
+            topicId: p.elementId, lessonId: TOPIC_MAP[p.elementId] ? TOPIC_MAP[p.elementId].lessonId : null,
+            originalSentence: p.japanese, correctedSentence: p.correctedText, explanation: p.feedback, ts: Date.now(),
+          }));
+          recordWeaknessOccurrences(weaknessItems);
+        }
       } else {
         // 既存(週次演習・remedial・weeklyRemedial)の挙動: 無変更
         const stats = { ...drillState.elementStats };
@@ -1824,6 +2047,13 @@ function App() {
         });
         saveDrillState({ ...drillState, elementStats: stats });
         appendDrillLog(problems.map(p => ({ ts: Date.now(), round: session.round, elementId: p.elementId, japanese: p.japanese, userAnswer: p.userAnswer, correct: p.correct, mistakeElementId: p.mistakeElementId })));
+        // Phase 7: 週次演習・remedial・weeklyRemedialからも登録する(CURRICULUM由来のidはlessonIdとして扱う)
+        const weaknessItems = problems.filter(p => !p.correct).map(p => ({
+          sourceType: session.round, errorType: p.errorType, errorPattern: p.errorPattern,
+          topicId: null, lessonId: p.elementId,
+          originalSentence: p.japanese, correctedSentence: p.correctedText, explanation: p.feedback, ts: Date.now(),
+        }));
+        recordWeaknessOccurrences(weaknessItems);
       }
 
       setSession({ ...session, stage: "result", problems });
