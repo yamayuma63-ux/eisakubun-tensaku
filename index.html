@@ -928,6 +928,119 @@ function getFallbackReviewProblems(weaknessItems) {
   });
 }
 
+// ---------- Phase 9: EXPRESSION ENGINE (MASTER_SPEC PART 11) ----------
+// redpen:expressions という独立localStorageキーに保存する。Weakness DB(redpen:weaknesses)とは
+// 完全に分離し、一切の相互参照・統合を行わない(Weakness=誤用の記録、Expression=正用の獲得記録)。
+// VOCAB_ENTRIES(Phase 3、36件)を唯一の初期データ源とし、新しいコンテンツは創作しない。
+// 状態遷移(UNSEEN/LEARNED/PRODUCED/MASTERED)はすべてアプリ側の決定的ロジックで行い、AIは
+// 「どのExpressionが解答内で実際に使われているか」の検出結果(id一覧)のみを返す。
+
+const EXPRESSION_PRODUCED_ESSAY_CAP = 20;
+const EXPRESSION_PRODUCED_DATES_CAP = 30;
+const MASTERED_MIN_PRODUCED_COUNT = 3;
+const MASTERED_MIN_DISTINCT_DAYS = 3;
+const MASTERED_MIN_DAY_SPAN = 7;
+
+function normalizeExpressionText(text) {
+  return (text || "").trim().toLowerCase().replace(/\s+/g, " ").replace(/[.,!?;:]+$/g, "");
+}
+function slugifyExpressionText(text) {
+  return text.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function computeExpressionId(text) {
+  return "ex-" + slugifyExpressionText(normalizeExpressionText(text));
+}
+
+// VOCAB_ENTRIES(Phase 3)の1件をExpressionレコードへ変換する。内容は既存データのコピーのみで、
+// 新規の意味・用法・例文は創作しない。初期masteryStateは必ずUNSEEN(DBに存在する=学習済み、を混同しない)。
+function buildExpressionFromVocabEntry(vocab) {
+  const nowIso = new Date().toISOString();
+  return {
+    expressionId: computeExpressionId(vocab.expression),
+    text: normalizeExpressionText(vocab.expression),
+    meaning: vocab.meaning, usage: vocab.usage, example: vocab.example, caution: vocab.caution, category: vocab.category,
+    origin: "curriculum", sourceVocabId: vocab.id,
+    masteryState: "UNSEEN",
+    seenCount: 0, practicedCount: 0,
+    producedCount: 0, producedEssayIds: [], producedDates: [],
+    firstProducedAt: null, lastProducedAt: null,
+    createdAt: nowIso, lastSeenAt: nowIso,
+    // Phase 8 Review基盤と同形のフィールドを型として予約するのみ。Phase 9では一切更新しない。
+    lastReviewedAt: null, nextReviewAt: null, reviewCount: 0, correctCount: 0,
+  };
+}
+
+// 空の場合のみ36件をシードする(既にシード済みなら何もしない、migration相当の処理は不要)。
+function seedExpressionsIfEmpty(existing) {
+  if (existing && Object.keys(existing).length > 0) return existing;
+  const seeded = {};
+  VOCAB_ENTRIES.forEach(v => {
+    const ex = buildExpressionFromVocabEntry(v);
+    seeded[ex.expressionId] = ex;
+  });
+  return seeded;
+}
+
+// ---------- Expression DB 専用アクセス層(drill-state/weaknessesとは完全に独立) ----------
+async function loadExpressions() {
+  try {
+    const r = await window.storage.get("expressions", false);
+    if (r) {
+      const parsed = JSON.parse(r.value);
+      if (Object.keys(parsed).length > 0) return parsed;
+    }
+  } catch (e) { console.error("loadExpressions failed", e); }
+  // キー未存在、または空の場合はここで初回シードする
+  const seeded = seedExpressionsIfEmpty({});
+  try { await window.storage.set("expressions", JSON.stringify(seeded), false); } catch (e) { console.error("seedExpressions save failed", e); }
+  return seeded;
+}
+async function saveExpressions(expressions) {
+  try {
+    await window.storage.set("expressions", JSON.stringify(expressions), false);
+  } catch (e) { console.error("saveExpressions failed (non-fatal)", e); }
+}
+
+// 自由英作文で検出された使用(expressionIdの配列)をExpression DBへ反映する純関数。
+// - 存在しないexpressionId(AIの幻覚)は無視する
+// - 同一essayId(freewrite:<ts>)からの重複カウントは禁止する
+// - MASTERED昇格判定は producedCount>=3 かつ distinct production days>=3 かつ
+//   (lastProducedAt - firstProducedAt) >= 7日 の3条件をすべて満たす場合のみ、アプリ側で機械的に行う。
+function applyExpressionProductions(expressions, usedExpressionIds, essayKey, nowTs) {
+  const now = nowTs || Date.now();
+  const nowIso = new Date(now).toISOString();
+  const todayStr = nowIso.slice(0, 10);
+  let next = expressions;
+  (usedExpressionIds || []).forEach(id => {
+    const ex = next[id];
+    if (!ex) return; // taxonomy外・存在しないIDは無視(識別の再判定は行わない)
+    if (ex.producedEssayIds.includes(essayKey)) return; // 同一Essayの二重カウント防止
+
+    const producedEssayIds = [...ex.producedEssayIds, essayKey].slice(-EXPRESSION_PRODUCED_ESSAY_CAP);
+    const producedDates = ex.producedDates.includes(todayStr)
+      ? ex.producedDates
+      : [...ex.producedDates, todayStr].slice(-EXPRESSION_PRODUCED_DATES_CAP);
+    const producedCount = ex.producedCount + 1;
+    const firstProducedAt = ex.firstProducedAt || nowIso;
+    const lastProducedAt = nowIso;
+
+    let masteryState = ex.masteryState;
+    if (masteryState === "UNSEEN" || masteryState === "LEARNED") masteryState = "PRODUCED";
+
+    const distinctDays = producedDates.length;
+    const daySpan = (new Date(lastProducedAt).getTime() - new Date(firstProducedAt).getTime()) / MS_PER_DAY;
+    if (producedCount >= MASTERED_MIN_PRODUCED_COUNT && distinctDays >= MASTERED_MIN_DISTINCT_DAYS && daySpan >= MASTERED_MIN_DAY_SPAN) {
+      masteryState = "MASTERED";
+    }
+
+    next = {
+      ...next,
+      [id]: { ...ex, producedEssayIds, producedDates, producedCount, firstProducedAt, lastProducedAt, masteryState, lastSeenAt: nowIso },
+    };
+  });
+  return next;
+}
+
 // ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
 // 静的コンテンツのみ。AI呼び出し・localStorage・既存UIには一切接続しない(閲覧用データ層のみ)。
 // Grammar系は Phase 2 の LESSONS/Topic と1対1対応。Logic/Vocabularyは講に依存しない独立教材。
@@ -1453,7 +1566,12 @@ async function generateFreeWriteTheme(source) {
   return JSON.parse(clean);
 }
 
-async function gradeFreeWrite(theme, essayText) {
+async function gradeFreeWrite(theme, essayText, expressionList) {
+  const list = expressionList || [];
+  const expressionBlock = list.length > 0
+    ? `\nさらに、以下はこの学習者が習得を目指している表現リストです。この解答の中で実際に自然な形で使用されている表現があれば、そのidだけをusedExpressionIdsとして返してください(リストにないIDを作らないこと。無理に該当を探す必要はなく、使われていなければ空配列でよい):
+${list.map(e => `${e.id}: ${e.text}`).join("\n")}`
+    : "";
   const sys = `あなたは自由英作文の採点者です。次の30点ルーブリックに厳密に従って採点してください。
 
 ① 課題達成・論旨適合性(10点): 設問に真正面から答えているか。主張が明確か。要求された内容を満たすか
@@ -1469,6 +1587,7 @@ ${CURRICULUM.map(e => `${e.id}: ${e.label}`).join("\n")}
 スペルミスや冠詞の単純な付け忘れなど、瑣末な誤りはminor:trueにしてください。文構造・時制・態・準動詞・関係詞・仮定法など、学習上重要な文法要素の誤りはminor:falseにしてください。
 
 各誤りについて、${ERROR_TYPE_PROMPT_BLOCK}
+${expressionBlock}
 
 以下のJSON形式のみを出力してください。説明やコードフェンスは付けないでください。
 {
@@ -1476,7 +1595,8 @@ ${CURRICULUM.map(e => `${e.id}: ${e.label}`).join("\n")}
   "comments": {"achievement": "日本語で短いコメント", "logic": "...", "grammar": "...", "vocabulary": "...", "composition": "..."},
   "overallComment": "全体講評を日本語で2〜4文",
   "modelAnswer": "この設問に対する模範解答の英文",
-  "grammarMistakes": [{"elementId": "要素IDまたはnull", "description": "誤りの内容を日本語で一言", "minor": true/false, "errorType": "分類のキーまたはnull", "errorPattern": "機械可読なキーまたはnull"}]
+  "grammarMistakes": [{"elementId": "要素IDまたはnull", "description": "誤りの内容を日本語で一言", "minor": true/false, "errorType": "分類のキーまたはnull", "errorPattern": "機械可読なキーまたはnull"}],
+  "usedExpressionIds": ["実際に使用されている表現のidのみ"]
 }`;
   const clean = await withRetry(() => callClaudeRaw(sys, `設問:\n${theme}\n\n解答:\n${essayText}`, 1400));
   return JSON.parse(clean);
@@ -1713,6 +1833,8 @@ function App() {
   // Phase 8: Review Engine専用のセッション・due件数(既存session/finalCheckSessionとは完全に独立)
   const [reviewSession, setReviewSession] = useState(null);
   const [weaknessDueCount, setWeaknessDueCount] = useState(0);
+  // Phase 9: Expression Arsenal(習得表現)の簡易統計。新規タブ・新規UIコンポーネントは作らない。
+  const [expressionStats, setExpressionStats] = useState({ producedOrAbove: 0, total: VOCAB_ENTRIES.length });
 
   // freewrite state
   const [freeWriteState, setFreeWriteState] = useState({ lastTs: null, usedThemes: [] });
@@ -1725,6 +1847,7 @@ function App() {
     if (view === "history") loadHistory();
     if (view === "drill" && !drillReady) loadDrillState();
     if (view === "drill") refreshWeaknessDueCount();
+    if (view === "drill") refreshExpressionStats();
     if (view === "freewrite" && !freeWriteReady) loadFreeWriteState();
   }, [view]);
 
@@ -1853,7 +1976,10 @@ function App() {
     setFreeWriteLoading(true);
     setFreeWriteError("");
     try {
-      const g = await gradeFreeWrite(freeWriteSession.theme, freeWriteSession.essayText);
+      const essayTs = Date.now();
+      const expressions = await loadExpressions();
+      const expressionList = Object.values(expressions).map(e => ({ id: e.expressionId, text: e.text }));
+      const g = await gradeFreeWrite(freeWriteSession.theme, freeWriteSession.essayText, expressionList);
       const cap = gateCap(g.scores.achievement);
       const rawTotal = FREEWRITE_CRITERIA.reduce((s, c) => s + g.scores[c.key], 0);
       const finalTotal = Math.min(rawTotal, cap);
@@ -1870,17 +1996,24 @@ function App() {
           sourceType: "freeWriting", errorType: m.errorType || null, errorPattern: m.errorPattern || null,
           topicId: null, lessonId: m.elementId,
           originalSentence: freeWriteSession.essayText, correctedSentence: "", explanation: m.description || "",
-          ts: Date.now(),
+          ts: essayTs,
         }));
       recordWeaknessOccurrences(weaknessItems);
+      // Phase 9: 検出された使用表現をExpression DBへ反映(存在しないIDは無視、同一Essayの二重カウント防止)
+      const essayKey = "freewrite:" + essayTs;
+      const validUsedIds = (g.usedExpressionIds || []).filter(id => !!expressions[id]);
+      if (validUsedIds.length > 0) {
+        const updatedExpressions = applyExpressionProductions(expressions, validUsedIds, essayKey, essayTs);
+        saveExpressions(updatedExpressions);
+      }
       const nextState = {
-        lastTs: Date.now(),
-        usedThemes: [...freeWriteState.usedThemes, { ts: Date.now(), theme: freeWriteSession.theme, source: freeWriteSession.source.key, finalTotal }].slice(-50),
+        lastTs: essayTs,
+        usedThemes: [...freeWriteState.usedThemes, { ts: essayTs, theme: freeWriteSession.theme, source: freeWriteSession.source.key, finalTotal }].slice(-50),
       };
       saveFreeWriteState(nextState);
       try {
-        await window.storage.set("freewrite:" + Date.now(), JSON.stringify({
-          ts: Date.now(), source: freeWriteSession.source.label, theme: freeWriteSession.theme,
+        await window.storage.set(essayKey, JSON.stringify({
+          ts: essayTs, source: freeWriteSession.source.label, theme: freeWriteSession.theme,
           essayText: freeWriteSession.essayText, finalTotal, rawTotal, mistakeElementIds,
         }), false);
       } catch (e) { /* best effort */ }
@@ -2128,6 +2261,16 @@ function App() {
       const weaknesses = await loadWeaknesses();
       setWeaknessDueCount(getDueWeaknesses(weaknesses).length);
     } catch (e) { console.error("refreshWeaknessDueCount failed", e); }
+  }
+
+  // Phase 9: 「習得表現: X/36(PRODUCED以上)」という1行統計のみ。押せるボタンではない。
+  async function refreshExpressionStats() {
+    try {
+      const expressions = await loadExpressions();
+      const values = Object.values(expressions);
+      const producedOrAbove = values.filter(e => e.masteryState === "PRODUCED" || e.masteryState === "MASTERED").length;
+      setExpressionStats({ producedOrAbove, total: values.length });
+    } catch (e) { console.error("refreshExpressionStats failed", e); }
   }
 
   async function generateReviewBatchProblems(weaknessItems, classificationList, totalDue) {
@@ -2512,6 +2655,7 @@ function App() {
                     {isMastered && isLastLesson && (
                       <div style={{ fontSize: 12, color: "#2F5D50", marginTop: 8 }}>🎉 全カリキュラムを修了しました！</div>
                     )}
+                    <div style={{ fontSize: 11.5, color: "#8A8478", marginTop: 8 }}>習得表現: {expressionStats.producedOrAbove}/{expressionStats.total}(PRODUCED以上)</div>
                   </div>
                   <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
                     <button onClick={startDaily} disabled={drillLoading || todayBlocked} style={primaryBtn(drillLoading || todayBlocked)}>{drillLoading ? "準備中..." : "今日の5問"}</button>
