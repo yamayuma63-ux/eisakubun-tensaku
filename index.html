@@ -330,6 +330,49 @@ function getFallbackProblems(elements) {
   });
 }
 
+// ---------- Phase 2: Curriculum Engine — Lesson / Topic schema (MASTER_SPEC PART 3) ----------
+// 既存の CURRICULUM / ELEMENT_MAP / FALLBACK_PROBLEMS の内容には一切手を加えていない。
+// ここではそれらから正式スキーマ(Lesson→Topic[])を導出するのみで、
+// 項目の追加・削除・順序変更・先取りは行っていない(MASTER_SPEC §6)。
+// 「今日の5問」「週次演習」等、既存の出題ロジックはこのブロックの影響を受けない(未接続)。
+const LESSONS = CURRICULUM.map((el, index) => {
+  const grammarTerms = el.desc.split(/[、･・]/).map(s => s.trim()).filter(Boolean);
+  const sourceExamples = (FALLBACK_PROBLEMS[el.id] || []).map(p => p.japanese);
+  return {
+    lessonId: el.id,
+    lessonOrder: index,
+    lessonTitle: el.label,
+    topics: [
+      {
+        topicId: el.id + "-T1",
+        lessonId: el.id,
+        topicName: el.label,
+        targetGrammar: grammarTerms,
+        targetExpressions: [],
+        explanation: el.desc,
+        sourceExamples: sourceExamples,
+        required: true,
+      },
+    ],
+  };
+});
+const LESSON_MAP = Object.fromEntries(LESSONS.map(l => [l.lessonId, l]));
+
+// Coverage計算(MASTER_SPEC §9)。既存の elementStats(attempts) を用いた読み取り専用の集計であり、
+// 出題・解放・進級など既存の判定ロジックには一切接続していない(Phase 4/5で正式に接続予定)。
+function computeLessonCoverage(lessonId, elementStats) {
+  const lesson = LESSON_MAP[lessonId];
+  if (!lesson) return { totalRequiredTopics: 0, coveredRequiredTopics: 0, coverageRate: 0 };
+  const requiredTopics = lesson.topics.filter(t => t.required);
+  const totalRequiredTopics = requiredTopics.length;
+  const coveredRequiredTopics = requiredTopics.filter(() => {
+    const stat = elementStats && elementStats[lessonId];
+    return !!(stat && stat.attempts > 0);
+  }).length;
+  const coverageRate = totalRequiredTopics > 0 ? coveredRequiredTopics / totalRequiredTopics : 0;
+  return { totalRequiredTopics, coveredRequiredTopics, coverageRate };
+}
+
 function extractJsonSubstring(text) {
   const firstObj = text.indexOf("{");
   const firstArr = text.indexOf("[");
