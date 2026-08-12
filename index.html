@@ -330,6 +330,21 @@ function getFallbackProblems(elements) {
   });
 }
 
+// Topic単位(Phase 4: Today's Five/Support)向けの予備問題。
+// FALLBACK_PROBLEMS(講単位)の中から、そのTopicのsourceExamplesに含まれる和文だけを抽出して使う
+// (Phase 2.5で既にTopicへ整理済みのデータをそのまま再利用。新規コンテンツの作成なし)。
+function getFallbackProblemsForTopics(elements) {
+  const used = {};
+  return elements.map(el => {
+    const topic = TOPIC_MAP[el.id];
+    const pool = topic ? (FALLBACK_PROBLEMS[topic.lessonId] || []).filter(p => topic.sourceExamples.includes(p.japanese)) : [];
+    const bank = pool.length > 0 ? pool : [{ japanese: `(${el.label}を使った文を作って訳してください)`, modelAnswer: "" }];
+    const idx = (used[el.id] || 0) % bank.length;
+    used[el.id] = (used[el.id] || 0) + 1;
+    return { elementId: el.id, japanese: bank[idx].japanese, modelAnswer: bank[idx].modelAnswer };
+  });
+}
+
 // ---------- Phase 2.5: Curriculum Refinement — 11 Lesson → 26 Topic (MASTER_SPEC PART 3) ----------
 // Design Review(ユーザー承認済み)に基づき、Phase 2の「1 Lesson = 1 Topic」を廃止し、
 // 各Lessonを意味的なまとまりで2〜3個のTopicへ再分割する。
@@ -498,6 +513,32 @@ function migrateToLessonProgress(oldDrillState) {
     topicProgress,
     currentLessonId: LESSONS[roughLessonIndex] ? LESSONS[roughLessonIndex].lessonId : null,
   };
+}
+
+// ---------- Phase 4: migrateToLessonProgress をlocalStorageへ初めて接続する処理 ----------
+// 接続の直前に必ず1回だけ、既存drill-state / drill-logのバックアップスナップショットを作成する。
+// 二重バックアップを避けるため、専用フラグキー(phase4-migration-backup-done)を用いる。
+async function migrateLessonProgressIfNeeded(state) {
+  if (state && state.lessonStates && state.topicProgress && state.currentLessonId) {
+    return state; // 既に移行済み
+  }
+  try {
+    const flagKey = "phase4-migration-backup-done";
+    const flag = await window.storage.get(flagKey, false).catch(() => null);
+    if (!flag) {
+      const snapshot = {};
+      const dsRaw = await window.storage.get("drill-state", false).catch(() => null);
+      const dlRaw = await window.storage.get("drill-log", false).catch(() => null);
+      if (dsRaw) snapshot["drill-state"] = dsRaw.value;
+      if (dlRaw) snapshot["drill-log"] = dlRaw.value;
+      await window.storage.set("backup-phase4-" + Date.now(), JSON.stringify(snapshot), false);
+      await window.storage.set(flagKey, "1", false);
+    }
+  } catch (e) {
+    console.error("Phase 4 migration backup failed (continuing conservatively)", e);
+  }
+  const migrated = migrateToLessonProgress(state || {});
+  return { ...(state || {}), ...migrated };
 }
 
 // ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
@@ -904,20 +945,28 @@ async function generateDrillProblems(elements) {
   // (同一内容の行を並べて渡すと出力形式が崩れやすいため)
   const counts = {};
   const order = [];
+  const info = {};
   elements.forEach(e => {
-    if (!counts[e.id]) { counts[e.id] = 0; order.push(e.id); }
+    if (!counts[e.id]) { counts[e.id] = 0; order.push(e.id); info[e.id] = e; }
     counts[e.id]++;
   });
-  const list = order.map(id => `${id}: ${ELEMENT_MAP[id].label}(${ELEMENT_MAP[id].desc}) — ${counts[id]}問`).join("\n");
+  // ELEMENT_MAP(旧CURRICULUM専用)には依存せず、渡された要素自身のlabel/descを使う。
+  // これにより旧来の要素(CURRICULUM由来)・新しいTopic由来の要素の両方をそのまま扱える(Phase 4)。
+  const list = order.map(id => `${id}: ${info[id].label}(${info[id].desc}) — ${counts[id]}問`).join("\n");
   const clean = await withRetry(() => callClaudeRaw(sys, list, 1400));
   return JSON.parse(clean);
 }
 
-async function gradeDrillAnswers(items) {
+async function gradeDrillAnswers(items, classificationList) {
+  // classificationList未指定時は従来通りCURRICULUM(旧11要素)を使う(週次演習・remedial等、後方互換)。
+  // Today's Five/Support(Phase 4)は26 Topicのリストを明示的に渡す。
+  const list = classificationList && classificationList.length > 0
+    ? classificationList
+    : CURRICULUM.map(e => ({ id: e.id, label: e.label }));
   const sys = `あなたは和文英訳問題の採点者です。日本人学習者の解答を採点してください。
 各設問には対象要素(targetElementId)が設定されていますが、実際に間違えた要素は対象要素と異なる場合もあるので、解答内容から正確に判定してください。
 選べる要素IDと説明は次の通りです:
-${CURRICULUM.map(e => `${e.id}: ${e.label}`).join("\n")}
+${list.map(e => `${e.id}: ${e.label}`).join("\n")}
 以下のJSON配列のみを出力してください。入力と同じ順番・同じ件数で返してください。説明やコードフェンスは付けないでください。
 [{"correct": true/false, "correctedText": "自然な模範解答(誤りがあれば修正した形)", "feedback": "日本語で短い一言フィードバック", "mistakeElementId": "間違えた要素のID。正解の場合はnull"}]`;
   const payload = items.map((it, i) => ({
@@ -1054,23 +1103,31 @@ function CriteriaBar({ label, score, max, comment }) {
 }
 
 const ROUND_LABEL = {
-  daily: "今日の5問", remedial: "定着問題(前回の間違い対策)",
+  daily: "今日の5問", support: "補助問題(当日の理解補助)",
+  remedial: "定着問題(前回の間違い対策)",
   weekly: "週次演習(10問)", weeklyRemedial: "定着問題(週次演習の間違い対策)",
 };
 
-function DrillSession({ session, onAnswerChange, onSubmit, onFinish, loading }) {
+function DrillSession({ session, onAnswerChange, onSubmit, onFinish, onSupport, loading }) {
   const allAnswered = session.problems.every(p => (p.userAnswer || "").trim().length > 0);
+  const labelFor = (id) => {
+    const found = (session.classificationList || []).find(x => x.id === id);
+    if (found) return found.label;
+    return ELEMENT_MAP[id]?.label || TOPIC_MAP[id]?.topicName || id;
+  };
+  const wrongCount = session.stage === "result" ? session.problems.filter(p => !p.correct).length : 0;
+  const canSupport = session.round === "daily" && wrongCount > 0 && typeof onSupport === "function";
   return (
     <div>
       <div style={{ ...cardStyle, marginBottom: 12 }}>
         <div style={labelStyle}>{ROUND_LABEL[session.round]}</div>
-        <div style={{ fontSize: 12, color: "#8A8478" }}>{session.problems.length}問 / 対象要素: {[...new Set(session.problems.map(p => ELEMENT_MAP[p.elementId]?.label))].join("・")}</div>
+        <div style={{ fontSize: 12, color: "#8A8478" }}>{session.problems.length}問 / 対象要素: {[...new Set(session.problems.map(p => labelFor(p.elementId)))].join("・")}</div>
         {session.usedFallback && <div style={{ fontSize: 11, color: "#C9A227", marginTop: 6 }}>※ AI生成が使えなかったため予備問題セットです</div>}
       </div>
       {session.problems.map((p, i) => (
         <div key={i} style={{ ...cardStyle, marginBottom: 12 }}>
           <div style={{ fontSize: 11, color: "#8A8478", marginBottom: 6, fontFamily: "'IBM Plex Mono', monospace" }}>
-            Q{i + 1} ・ {ELEMENT_MAP[p.elementId]?.label}
+            Q{i + 1} ・ {labelFor(p.elementId)}
           </div>
           <div style={{ fontFamily: "'Newsreader', serif", fontSize: 17, color: "#2A2620", marginBottom: 10, lineHeight: 1.7 }}>{p.japanese}</div>
           {session.stage === "answering" ? (
@@ -1097,7 +1154,14 @@ function DrillSession({ session, onAnswerChange, onSubmit, onFinish, loading }) 
           {loading ? "採点中..." : "採点する"}
         </button>
       ) : (
-        <button onClick={onFinish} style={primaryBtn(false)}>完了</button>
+        <div style={{ display: "flex", gap: 10 }}>
+          {canSupport && (
+            <button onClick={onSupport} disabled={loading} style={ghostBtnWide}>
+              {loading ? "準備中..." : "補助問題に進む"}
+            </button>
+          )}
+          <button onClick={onFinish} style={primaryBtn(false)}>完了</button>
+        </div>
       )}
     </div>
   );
@@ -1164,19 +1228,22 @@ function App() {
   async function loadDrillState() {
     try {
       const r = await window.storage.get("drill-state", false);
+      let state;
       if (r) {
         const parsed = JSON.parse(r.value);
         if (parsed.curriculumVersion !== CURRICULUM_VERSION) {
           // カリキュラムの形式が変わったため進捗をリセット
-          const reset = { progressPointer: 0, elementStats: {}, curriculumVersion: CURRICULUM_VERSION };
-          setDrillState(reset);
-          window.storage.set("drill-state", JSON.stringify(reset), false).catch(() => {});
+          state = { progressPointer: 0, elementStats: {}, curriculumVersion: CURRICULUM_VERSION };
         } else {
-          setDrillState(parsed);
+          state = parsed;
         }
       } else {
-        setDrillState({ progressPointer: 0, elementStats: {}, curriculumVersion: CURRICULUM_VERSION });
+        state = { progressPointer: 0, elementStats: {}, curriculumVersion: CURRICULUM_VERSION };
       }
+      // Phase 4: lessonStates/topicProgress/currentLessonId が無ければ、バックアップを取った上で移行する
+      state = await migrateLessonProgressIfNeeded(state);
+      setDrillState(state);
+      window.storage.set("drill-state", JSON.stringify({ ...state, curriculumVersion: CURRICULUM_VERSION }), false).catch(() => {});
     } catch (e) { console.error("loadDrillState failed", e); }
     setDrillReady(true);
   }
@@ -1290,21 +1357,38 @@ function App() {
     setFreeWriteLoading(false);
   }
 
-  function pickDailyElements() {
-    const n = CURRICULUM.length;
-    const cycleDone = drillState.progressPointer >= n;
-    if (!cycleDone) {
-      // 1周目: 30日程度でカリキュラムを一周するペースで、同じ講を数日かけて繰り返す
-      const idx = Math.floor(drillState.progressPointer) % n;
-      const el = CURRICULUM[idx];
-      const elements = [el, el, el, el, el];
-      const increment = n / DAYS_TO_COMPLETE_CYCLE;
-      return { elements, increment };
+  // ---------- Phase 4: Today's Five (26 Topicベース、新規学習専用) ----------
+  function topicToElement(topic) {
+    return { id: topic.topicId, label: topic.topicName, desc: topic.targetGrammar.join("、") };
+  }
+
+  // 現在Lessonの未Coverage Topicから、requiredExposuresの残数をラウンドロビンで埋めて最大5問分選ぶ。
+  // 全Topicがcovered済みなら done:true を返す(新規問題は生成しない)。
+  function pickTodayTopics() {
+    const lesson = LESSON_MAP[drillState.currentLessonId];
+    if (!lesson) return { topics: [], done: false };
+    const topicProgress = drillState.topicProgress || {};
+    const uncovered = lesson.topics.filter(t => !isTopicCovered(t, topicProgress[t.topicId]));
+    if (uncovered.length === 0) return { topics: [], done: true };
+    const remaining = {};
+    uncovered.forEach(t => {
+      const cur = topicProgress[t.topicId] || createEmptyTopicProgress();
+      remaining[t.topicId] = Math.max(0, (t.requiredExposures || REQUIRED_EXPOSURES_DEFAULT) - cur.plannedExposureCount);
+    });
+    const queue = [];
+    let progressed = true;
+    while (queue.length < 5 && progressed) {
+      progressed = false;
+      for (const t of uncovered) {
+        if (queue.length >= 5) break;
+        if (remaining[t.topicId] > 0) {
+          queue.push(t);
+          remaining[t.topicId] -= 1;
+          progressed = true;
+        }
+      }
     }
-    // 1周終了後はランダム出題
-    const elements = [];
-    for (let i = 0; i < 5; i++) elements.push(CURRICULUM[Math.floor(Math.random() * n)]);
-    return { elements, increment: 0 };
+    return { topics: queue, done: false };
   }
 
   function pickWeeklyElements() {
@@ -1313,38 +1397,70 @@ function App() {
     return weightedSample(pool, e => (drillState.elementStats[e.id]?.mistakes || 0) + 1, 10);
   }
 
+  const TOPIC_BASED_ROUNDS = ["daily", "support"];
+
   async function startRound(round, elements) {
     setDrillError("");
     setDrillWarning("");
     setDrillLoading(true);
+    const isTopicRound = TOPIC_BASED_ROUNDS.includes(round);
+    const classificationList = isTopicRound
+      ? ALL_TOPICS.map(t => ({ id: t.topicId, label: t.topicName }))
+      : CURRICULUM.map(e => ({ id: e.id, label: e.label }));
     try {
       const probs = await generateDrillProblems(elements);
       if (!Array.isArray(probs) || probs.length !== elements.length) {
         throw new Error("problem count mismatch: expected " + elements.length + ", got " + (probs && probs.length));
       }
       const problems = probs.map(p => ({ ...p, userAnswer: "" }));
-      setSession({ round, stage: "answering", problems, usedFallback: false });
+      setSession({ round, stage: "answering", problems, usedFallback: false, classificationList });
     } catch (e) {
       console.error("generateDrillProblems failed, using fallback bank", e);
-      const problems = getFallbackProblems(elements).map(p => ({ ...p, userAnswer: "" }));
-      setSession({ round, stage: "answering", problems, usedFallback: true });
+      const problems = (isTopicRound ? getFallbackProblemsForTopics(elements) : getFallbackProblems(elements)).map(p => ({ ...p, userAnswer: "" }));
+      setSession({ round, stage: "answering", problems, usedFallback: true, classificationList });
       setDrillWarning("AIによる問題生成が一時的にできなかったため、予備の問題セットを表示しています。");
     }
     setDrillLoading(false);
   }
 
   async function startDaily() {
-    const { elements, increment } = pickDailyElements();
-    await startRound("daily", elements);
-    if (increment > 0) {
-      const raw = drillState.progressPointer + increment;
-      const next = { ...drillState, progressPointer: Math.min(raw, CURRICULUM.length) };
-      saveDrillState(next);
+    const { topics, done } = pickTodayTopics();
+    if (done) {
+      // このLessonの新規学習は完了(Coverage100%)。新規問題は生成せず、LEARNING_COMPLETEへ遷移するのみ。
+      // 次Lesson解放・MASTERED付与はPhase 5のFinal Checkのみが行う(Today's Fiveはここまで)。
+      const lessonId = drillState.currentLessonId;
+      if (lessonId) {
+        const lessonStates = { ...(drillState.lessonStates || {}) };
+        const cur = lessonStates[lessonId] || { lessonId, status: LESSON_STATUS.LEARNING };
+        if (cur.status === LESSON_STATUS.LEARNING) {
+          saveDrillState({ ...drillState, lessonStates: { ...lessonStates, [lessonId]: { ...cur, status: LESSON_STATUS.LEARNING_COMPLETE } } });
+        }
+      }
+      return;
     }
+    const elements = topics.map(topicToElement);
+    await startRound("daily", elements);
   }
 
   async function startWeekly() {
     await startRound("weekly", pickWeeklyElements());
+  }
+
+  // Today's Fiveで誤答したTopicにつき最大1問、1日合計最大5問のSupport(当日の理解補助)を生成する。
+  // Coverageには一切加算しない(supportExposureCountのみ更新、submitSession側で分離)。
+  async function startSupportRound() {
+    const wrong = session.problems.filter(p => !p.correct);
+    const uniqueTopicIds = [...new Set(wrong.map(p => (p.mistakeElementId && TOPIC_MAP[p.mistakeElementId]) ? p.mistakeElementId : p.elementId))];
+    const cappedIds = uniqueTopicIds.slice(0, 5); // 1日合計最大5問(=Topicごと最大1問なので自然にこの上限に収まる)
+    const supportTopics = cappedIds.map(id => TOPIC_MAP[id]).filter(Boolean);
+    if (supportTopics.length === 0) { setSession(null); return; }
+    await startRound("support", supportTopics.map(topicToElement));
+  }
+
+  function finishDailySession() {
+    // Today's Five/Support は自動連鎖しない。誤答があっても「完了」で単純に終了する
+    // (Supportへ進むかどうかはユーザーが明示的にボタンを押した場合のみ)。
+    setSession(null);
   }
 
   function updateAnswer(i, val) {
@@ -1359,7 +1475,7 @@ function App() {
     setDrillLoading(true);
     setDrillError("");
     try {
-      const graded = await gradeDrillAnswers(session.problems);
+      const graded = await gradeDrillAnswers(session.problems, session.classificationList);
       const problems = session.problems.map((p, i) => ({
         ...p,
         correct: graded[i].correct,
@@ -1367,20 +1483,52 @@ function App() {
         feedback: graded[i].feedback,
         mistakeElementId: graded[i].mistakeElementId,
       }));
-      // update stats
-      const stats = { ...drillState.elementStats };
-      problems.forEach(p => {
-        const target = p.elementId;
-        stats[target] = stats[target] || { attempts: 0, mistakes: 0 };
-        stats[target] = { attempts: stats[target].attempts + 1, mistakes: stats[target].mistakes + (p.correct ? 0 : 1) };
-        if (!p.correct && p.mistakeElementId && p.mistakeElementId !== target && ELEMENT_MAP[p.mistakeElementId]) {
-          const m = p.mistakeElementId;
-          stats[m] = stats[m] || { attempts: 0, mistakes: 0 };
-          stats[m] = { ...stats[m], mistakes: stats[m].mistakes + 1 };
+
+      if (TOPIC_BASED_ROUNDS.includes(session.round)) {
+        // Phase 4: Today's Five / Support — TopicProgressを更新する(旧elementStatsには一切触れない)
+        const isSupport = session.round === "support";
+        const nowIso = new Date().toISOString();
+        const topicProgress = { ...(drillState.topicProgress || {}) };
+        problems.forEach(p => {
+          const tid = p.elementId;
+          const cur = topicProgress[tid] || createEmptyTopicProgress();
+          topicProgress[tid] = isSupport
+            ? { ...cur, supportExposureCount: cur.supportExposureCount + 1, lastSupportExposureAt: nowIso }
+            : { ...cur, plannedExposureCount: cur.plannedExposureCount + 1, lastPlannedExposureAt: nowIso };
+        });
+        let lessonStates = { ...(drillState.lessonStates || {}) };
+        if (!isSupport && drillState.currentLessonId) {
+          const cov = computeLessonCoverage(drillState.currentLessonId, topicProgress);
+          if (cov.coverageRate >= 1) {
+            const cur = lessonStates[drillState.currentLessonId] || { lessonId: drillState.currentLessonId, status: LESSON_STATUS.LEARNING };
+            if (cur.status === LESSON_STATUS.LEARNING) {
+              lessonStates = { ...lessonStates, [drillState.currentLessonId]: { ...cur, status: LESSON_STATUS.LEARNING_COMPLETE } };
+            }
+          }
         }
-      });
-      saveDrillState({ ...drillState, elementStats: stats });
-      appendDrillLog(problems.map(p => ({ ts: Date.now(), round: session.round, elementId: p.elementId, japanese: p.japanese, userAnswer: p.userAnswer, correct: p.correct, mistakeElementId: p.mistakeElementId })));
+        saveDrillState({ ...drillState, topicProgress, lessonStates });
+        appendDrillLog(problems.map(p => ({
+          ts: Date.now(), round: session.round, sourceType: isSupport ? "support" : "today",
+          topicId: p.elementId, elementId: p.elementId, japanese: p.japanese,
+          userAnswer: p.userAnswer, correct: p.correct, mistakeElementId: p.mistakeElementId,
+        })));
+      } else {
+        // 既存(週次演習・remedial・weeklyRemedial)の挙動: 無変更
+        const stats = { ...drillState.elementStats };
+        problems.forEach(p => {
+          const target = p.elementId;
+          stats[target] = stats[target] || { attempts: 0, mistakes: 0 };
+          stats[target] = { attempts: stats[target].attempts + 1, mistakes: stats[target].mistakes + (p.correct ? 0 : 1) };
+          if (!p.correct && p.mistakeElementId && p.mistakeElementId !== target && ELEMENT_MAP[p.mistakeElementId]) {
+            const m = p.mistakeElementId;
+            stats[m] = stats[m] || { attempts: 0, mistakes: 0 };
+            stats[m] = { ...stats[m], mistakes: stats[m].mistakes + 1 };
+          }
+        });
+        saveDrillState({ ...drillState, elementStats: stats });
+        appendDrillLog(problems.map(p => ({ ts: Date.now(), round: session.round, elementId: p.elementId, japanese: p.japanese, userAnswer: p.userAnswer, correct: p.correct, mistakeElementId: p.mistakeElementId })));
+      }
+
       setSession({ ...session, stage: "result", problems });
     } catch (e) {
       setDrillError("採点に失敗しました。もう一度お試しください。");
@@ -1389,6 +1537,7 @@ function App() {
   }
 
   async function finishSession() {
+    // 週次演習・remedial・weeklyRemedial専用(無変更)。Today's Five/SupportはfinishDailySessionを使う。
     const wrong = session.problems.filter(p => !p.correct);
     const isRemedialRound = session.round === "remedial" || session.round === "weeklyRemedial";
     if (wrong.length > 0 && !isRemedialRound) {
@@ -1525,56 +1674,73 @@ function App() {
                 <button onClick={() => saveDrillState(drillState)} style={{ ...ghostBtn, whiteSpace: "nowrap" }}>今すぐ再送信</button>
               </div>
             )}
-            {!session && (
-              <div>
-                <div style={{ ...cardStyle, marginBottom: 12 }}>
-                  <div style={labelStyle}>進捗</div>
-                  {drillState.progressPointer >= CURRICULUM.length ? (
-                    <div style={{ fontSize: 13, color: "#3A3529" }}>カリキュラム1周 完了 ・ 以降はランダム出題です</div>
-                  ) : (
-                    <div style={{ fontSize: 13, color: "#3A3529" }}>
-                      約{DAYS_TO_COMPLETE_CYCLE}日で1周予定 ・ 現在: {ELEMENT_MAP[CURRICULUM[Math.floor(drillState.progressPointer) % CURRICULUM.length].id].label}
+            {!session && (() => {
+              const lesson = LESSON_MAP[drillState.currentLessonId];
+              const cov = lesson ? computeLessonCoverage(lesson.lessonId, drillState.topicProgress || {}) : { totalRequiredTopics: 0, coveredRequiredTopics: 0, coverageRate: 0 };
+              const isDone = !!lesson && cov.coverageRate >= 1;
+              return (
+                <div>
+                  <div style={{ ...cardStyle, marginBottom: 12 }}>
+                    <div style={labelStyle}>進捗</div>
+                    {lesson ? (
+                      <div style={{ fontSize: 13, color: "#3A3529" }}>
+                        現在のLesson: {lesson.lessonTitle} ・ Coverage {cov.coveredRequiredTopics}/{cov.totalRequiredTopics} Topic
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 13, color: "#8A8478" }}>読み込み中...</div>
+                    )}
+                    <div style={{ height: 6, background: "#E7E0CE", borderRadius: 3, marginTop: 8, overflow: "hidden" }}>
+                      <div style={{ width: (cov.coverageRate * 100) + "%", height: "100%", background: "linear-gradient(90deg,#B23A2E,#C9A227)" }} />
+                    </div>
+                    {isDone && (
+                      <div style={{ fontSize: 12, color: "#C9A227", marginTop: 8 }}>
+                        🚧 このLessonの新規学習は完了しました。講末確認テストは現在開発中です(近日、正式な確認テストへの導線に置き換わります)。
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                    <button onClick={startDaily} disabled={drillLoading || isDone} style={primaryBtn(drillLoading || isDone)}>{drillLoading ? "準備中..." : "今日の5問"}</button>
+                    <button onClick={startWeekly} disabled={drillLoading || Object.keys(drillState.elementStats).length === 0} style={ghostBtnWide}>週次演習(10問)</button>
+                  </div>
+                  {masteryList.length > 0 && (
+                    <div style={cardStyle}>
+                      <div style={labelStyle}>要素別 定着度(誤答率が高い順)</div>
+                      {masteryList.map(m => (
+                        <div key={m.id} style={{ marginBottom: 10 }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "#4B4640" }}>
+                            <span>{m.label}</span>
+                            <span style={{ color: "#8A8478" }}>{m.attempts - m.mistakes}/{m.attempts} 正解</span>
+                          </div>
+                          <div style={{ height: 5, background: "#E7E0CE", borderRadius: 3, marginTop: 3, overflow: "hidden" }}>
+                            <div style={{ width: (100 - (m.mistakes / m.attempts * 100)) + "%", height: "100%", background: "#2F5D50" }} />
+                          </div>
+                        </div>
+                      ))}
                     </div>
                   )}
-                  <div style={{ height: 6, background: "#E7E0CE", borderRadius: 3, marginTop: 8, overflow: "hidden" }}>
-                    <div style={{ width: (Math.min(drillState.progressPointer, CURRICULUM.length) / CURRICULUM.length * 100) + "%", height: "100%", background: "linear-gradient(90deg,#B23A2E,#C9A227)" }} />
+                  <div style={{ marginTop: 14 }}>
+                    <button onClick={() => setShowExport(v => !v)} style={ghostBtnWide}>{showExport ? "進捗データを隠す" : "進捗データをバックアップ用に表示"}</button>
+                    {showExport && (
+                      <textarea
+                        readOnly
+                        value={JSON.stringify({ currentLessonId: drillState.currentLessonId, lessonStates: drillState.lessonStates, topicProgress: drillState.topicProgress, progressPointer: drillState.progressPointer, elementStats: drillState.elementStats }, null, 2)}
+                        onFocus={(e) => e.target.select()}
+                        style={{ width: "100%", minHeight: 140, marginTop: 8, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, color: "#3A3529", border: "1px solid #E7E0CE", borderRadius: 6, padding: 8, boxSizing: "border-box", background: "#FAF6EC" }}
+                      />
+                    )}
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
-                  <button onClick={startDaily} disabled={drillLoading} style={primaryBtn(drillLoading)}>{drillLoading ? "準備中..." : "今日の5問"}</button>
-                  <button onClick={startWeekly} disabled={drillLoading || Object.keys(drillState.elementStats).length === 0} style={ghostBtnWide}>週次演習(10問)</button>
-                </div>
-                {masteryList.length > 0 && (
-                  <div style={cardStyle}>
-                    <div style={labelStyle}>要素別 定着度(誤答率が高い順)</div>
-                    {masteryList.map(m => (
-                      <div key={m.id} style={{ marginBottom: 10 }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "#4B4640" }}>
-                          <span>{m.label}</span>
-                          <span style={{ color: "#8A8478" }}>{m.attempts - m.mistakes}/{m.attempts} 正解</span>
-                        </div>
-                        <div style={{ height: 5, background: "#E7E0CE", borderRadius: 3, marginTop: 3, overflow: "hidden" }}>
-                          <div style={{ width: (100 - (m.mistakes / m.attempts * 100)) + "%", height: "100%", background: "#2F5D50" }} />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <div style={{ marginTop: 14 }}>
-                  <button onClick={() => setShowExport(v => !v)} style={ghostBtnWide}>{showExport ? "進捗データを隠す" : "進捗データをバックアップ用に表示"}</button>
-                  {showExport && (
-                    <textarea
-                      readOnly
-                      value={JSON.stringify({ progressPointer: drillState.progressPointer, elementStats: drillState.elementStats }, null, 2)}
-                      onFocus={(e) => e.target.select()}
-                      style={{ width: "100%", minHeight: 140, marginTop: 8, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, color: "#3A3529", border: "1px solid #E7E0CE", borderRadius: 6, padding: 8, boxSizing: "border-box", background: "#FAF6EC" }}
-                    />
-                  )}
-                </div>
-              </div>
-            )}
+              );
+            })()}
             {session && (
-              <DrillSession session={session} onAnswerChange={updateAnswer} onSubmit={submitSession} onFinish={finishSession} loading={drillLoading} />
+              <DrillSession
+                session={session}
+                onAnswerChange={updateAnswer}
+                onSubmit={submitSession}
+                onFinish={(session.round === "daily" || session.round === "support") ? finishDailySession : finishSession}
+                onSupport={session.round === "daily" ? startSupportRound : undefined}
+                loading={drillLoading}
+              />
             )}
           </div>
         )}
