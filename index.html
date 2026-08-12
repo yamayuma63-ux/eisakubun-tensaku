@@ -541,6 +541,62 @@ async function migrateLessonProgressIfNeeded(state) {
   return { ...(state || {}), ...migrated };
 }
 
+// ---------- Phase 5: FINAL CHECK — 決定ロジック(アプリ側の純関数。AIはscore/assessmentのみ返す) ----------
+
+// 出題配分: 現在Lesson60〜70%(6〜7問) + 過去Lesson(MASTERED/LEARNING_COMPLETEのみ)30〜40%。
+// 過去Lessonプールが不足する場合は現在Lessonで埋める(未習Lessonからは絶対に出題しない)。
+function pickFinalCheckTopics(drillState) {
+  const lesson = LESSON_MAP[drillState.currentLessonId];
+  if (!lesson) return { currentTopics: [], pastTopics: [] };
+  const desiredCurrentCount = 6 + Math.floor(Math.random() * 2); // 6 or 7
+  const pastPool = LESSONS
+    .filter(l => l.lessonId !== lesson.lessonId)
+    .filter(l => {
+      const st = (drillState.lessonStates && drillState.lessonStates[l.lessonId] && drillState.lessonStates[l.lessonId].status) || LESSON_STATUS.LOCKED;
+      return st === LESSON_STATUS.MASTERED || st === LESSON_STATUS.LEARNING_COMPLETE;
+    })
+    .flatMap(l => l.topics);
+  const desiredPastCount = Math.min(10 - desiredCurrentCount, pastPool.length);
+  const currentCount = 10 - desiredPastCount;
+  const currentTopics = [];
+  for (let i = 0; i < currentCount; i++) currentTopics.push(lesson.topics[i % lesson.topics.length]);
+  const pastTopics = [];
+  for (let i = 0; i < desiredPastCount; i++) pastTopics.push(pastPool[Math.floor(Math.random() * pastPool.length)]);
+  return { currentTopics, pastTopics };
+}
+
+// targetSkillAssessment="avoided" の答案は、AIの自己申告に関わらずアプリが強制的に上限6点へ切り下げる。
+function capFinalCheckScore(raw) {
+  const score = Math.max(0, Math.min(10, Math.round(Number(raw.score) || 0)));
+  const assessment = raw.targetSkillAssessment === "used" || raw.targetSkillAssessment === "equivalent" || raw.targetSkillAssessment === "avoided"
+    ? raw.targetSkillAssessment : "used";
+  const cappedScore = assessment === "avoided" ? Math.min(score, 6) : score;
+  return { score, cappedScore, targetSkillAssessment: assessment, usedTargetSkill: assessment !== "avoided" };
+}
+
+// 合計点・得点率・PASS判定はアプリ側の決定ロジックのみで行う(AIには合否を一切尋ねない)。
+function computeFinalCheckResult(cappedScores) {
+  const totalScore = cappedScores.reduce((s, c) => s + c, 0);
+  const maxScore = cappedScores.length * 10;
+  const percentage = maxScore > 0 ? totalScore / maxScore : 0;
+  const passed = percentage >= 0.75;
+  return { totalScore, maxScore, percentage, passed };
+}
+
+// PASS時のみ、次Lesson(lessonOrderで直後)がLOCKEDならLEARNINGへ解放する。最終Lessonなら何もしない。
+function unlockNextLessonIfNeeded(lessonStates, currentLessonId) {
+  const idx = LESSONS.findIndex(l => l.lessonId === currentLessonId);
+  if (idx === -1 || idx === LESSONS.length - 1) {
+    return { lessonStates, nextLessonId: null, isLastLesson: idx === LESSONS.length - 1 };
+  }
+  const next = LESSONS[idx + 1];
+  const nextState = (lessonStates && lessonStates[next.lessonId]) || { lessonId: next.lessonId, status: LESSON_STATUS.LOCKED };
+  const updated = nextState.status === LESSON_STATUS.LOCKED
+    ? { ...lessonStates, [next.lessonId]: { ...nextState, status: LESSON_STATUS.LEARNING } }
+    : lessonStates;
+  return { lessonStates: updated, nextLessonId: next.lessonId, isLastLesson: false };
+}
+
 // ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
 // 静的コンテンツのみ。AI呼び出し・localStorage・既存UIには一切接続しない(閲覧用データ層のみ)。
 // Grammar系は Phase 2 の LESSONS/Topic と1対1対応。Logic/Vocabularyは講に依存しない独立教材。
@@ -977,6 +1033,55 @@ ${list.map(e => `${e.id}: ${e.label}`).join("\n")}
   return JSON.parse(clean);
 }
 
+// ---------- Phase 5: FINAL CHECK — 問題生成・採点(内部10点方式) ----------
+async function generateFinalCheckProblems(elements, avoidJapanese) {
+  const avoidNote = (avoidJapanese && avoidJapanese.length > 0)
+    ? `\n以下の例文は直近の確認テストで使用済みのため、同じ文や酷似した文は避けてください:\n${avoidJapanese.join("\n")}`
+    : "";
+  const sys = `あなたは講末確認テストの出題者です。
+以下の各行は「要素ID: 要素名(説明) — N問」の形式です。要素ごとに指定されたN問ぶん、それぞれ異なる状況設定の和文英訳問題を作成してください。
+日本語の例文は1〜2文程度で、その要素を使わないと訳しにくい状況設定にしてください。${avoidNote}
+以下のJSON配列のみを出力してください。説明やコードフェンスは付けないでください。配列内の要素数は、指定された問数の合計と必ず一致させてください。
+[{"elementId": "要素のID", "japanese": "和文問題文", "modelAnswer": "模範解答の英文"}]`;
+  const counts = {};
+  const order = [];
+  const info = {};
+  elements.forEach(e => {
+    if (!counts[e.id]) { counts[e.id] = 0; order.push(e.id); info[e.id] = e; }
+    counts[e.id]++;
+  });
+  const list = order.map(id => `${id}: ${info[id].label}(${info[id].desc}) — ${counts[id]}問`).join("\n");
+  const clean = await withRetry(() => callClaudeRaw(sys, list, 1800));
+  return JSON.parse(clean);
+}
+
+async function gradeFinalCheckAnswers(items, classificationList) {
+  const list = classificationList && classificationList.length > 0
+    ? classificationList
+    : CURRICULUM.map(e => ({ id: e.id, label: e.label }));
+  const sys = `あなたは講末確認テストの採点者です。日本人学習者の解答を、以下の基準で0〜10点の内部点数で採点してください。
+10=完全 9=ほぼ完全 8=軽微な問題 7=概ね理解 6=意味は通るが問題あり 5=部分的理解 3-4=重大な問題 1-2=ほぼ未習得 0=無回答・無関係
+
+各設問には対象要素(targetElementId)が設定されています。その要素の運用力を確認する問題なので、
+解答が対象要素をどう扱っているか(targetSkillAssessment)も必ず判定してください。
+- "used": 対象要素をそのまま使って解答している
+- "equivalent": 対象要素とは異なる表現だが、文法的に正しく、設問の意図を自然に満たす別解になっている(回避とはみなさない)
+- "avoided": 対象要素を使わずに済む書き方で回避している、または誤って使えていない
+
+選べる要素IDと説明は次の通りです:
+${list.map(e => `${e.id}: ${e.label}`).join("\n")}
+
+模範解答と表現が異なっていても、文法的に正しく設問の意図を満たしていれば高く採点してください。自然な別解を文法的誤答として減点しないでください。
+以下のJSON配列のみを出力してください。入力と同じ順番・同じ件数で返してください。説明やコードフェンスは付けないでください。
+[{"score": 0-10, "targetSkillAssessment": "used"|"equivalent"|"avoided", "correctedText": "自然な模範解答", "feedback": "日本語で短いコメント"}]`;
+  const payload = items.map((it, i) => ({
+    no: i + 1, targetElementId: it.elementId, japanese: it.japanese,
+    modelAnswer: it.modelAnswer, userAnswer: it.userAnswer,
+  }));
+  const clean = await withRetry(() => callClaudeRaw(sys, JSON.stringify(payload), 1800));
+  return JSON.parse(clean);
+}
+
 // ---------- 自由英作文モード(3日に1回) ----------
 const FREEWRITE_SOURCES = [
   { key: "juntendo", label: "順天堂大学(医学部)形式", note: "医療・社会的テーマについて、資料や状況設定を踏まえて意見を述べる形式。150〜200語程度。" },
@@ -1167,6 +1272,70 @@ function DrillSession({ session, onAnswerChange, onSubmit, onFinish, onSupport, 
   );
 }
 
+// ---------- Phase 5: FINAL CHECK 表示コンポーネント(10点方式のため通常のDrillSessionとは分離) ----------
+function FinalCheckSession({ session, onAnswerChange, onSubmit, onFinish, onRemedial, loading }) {
+  const allAnswered = session.problems.every(p => (p.userAnswer || "").trim().length > 0);
+  const labelFor = (id) => {
+    const found = (session.classificationList || []).find(x => x.id === id);
+    return found ? found.label : (TOPIC_MAP[id]?.topicName || id);
+  };
+  return (
+    <div>
+      <div style={{ ...cardStyle, marginBottom: 12 }}>
+        <div style={labelStyle}>講末確認テスト({session.problems.length}問)</div>
+        {session.usedFallback && <div style={{ fontSize: 11, color: "#C9A227", marginTop: 6 }}>※ AI生成が使えなかったため予備問題セットです</div>}
+      </div>
+      {session.problems.map((p, i) => (
+        <div key={i} style={{ ...cardStyle, marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: "#8A8478", marginBottom: 6, fontFamily: "'IBM Plex Mono', monospace" }}>
+            Q{i + 1} ・ {labelFor(p.elementId)}
+          </div>
+          <div style={{ fontFamily: "'Newsreader', serif", fontSize: 17, color: "#2A2620", marginBottom: 10, lineHeight: 1.7 }}>{p.japanese}</div>
+          {session.stage === "answering" ? (
+            <textarea
+              value={p.userAnswer || ""}
+              onChange={(e) => onAnswerChange(i, e.target.value)}
+              placeholder="英訳を入力"
+              style={{ width: "100%", minHeight: 60, fontFamily: "'Newsreader', serif", fontSize: 15.5, border: "1px solid #E7E0CE", borderRadius: 6, padding: 8, boxSizing: "border-box" }}
+            />
+          ) : (
+            <div>
+              <div style={{ fontSize: 14.5, color: p.cappedScore >= 7 ? "#2F5D50" : "#B23A2E", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 4 }}>
+                {p.score}/10点{p.cappedScore !== p.score ? `(target skill回避のため上限適用: ${p.cappedScore}点)` : ""}
+              </div>
+              <div style={{ fontSize: 14, color: "#3A3529", marginBottom: 4 }}><b>あなたの解答:</b> {p.userAnswer}</div>
+              <div style={{ fontSize: 14, color: "#2F5D50", marginBottom: 4 }}><b>模範解答:</b> {p.correctedText}</div>
+              <div style={{ fontSize: 12.5, color: "#5A5347", fontStyle: "italic" }}>{p.feedback}</div>
+            </div>
+          )}
+        </div>
+      ))}
+      {session.stage === "answering" ? (
+        <button onClick={onSubmit} disabled={loading || !allAnswered} style={primaryBtn(loading || !allAnswered)}>
+          {loading ? "採点中..." : "採点する"}
+        </button>
+      ) : (
+        <div>
+          <div style={{ ...cardStyle, marginBottom: 12 }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: session.result.passed ? "#2F5D50" : "#B23A2E", fontFamily: "'Fraunces', serif" }}>
+              {session.result.totalScore}/{session.result.maxScore}点({Math.round(session.result.percentage * 100)}%) ・ {session.result.passed ? "PASS" : "REMEDIAL"}
+            </div>
+            {session.result.passed && session.isLastLesson && <div style={{ fontSize: 13, color: "#2F5D50", marginTop: 6 }}>🎉 全カリキュラムを修了しました！</div>}
+            {session.result.passed && !session.isLastLesson && <div style={{ fontSize: 13, color: "#3A3529", marginTop: 6 }}>次のLessonが解放されました。</div>}
+            {!session.result.passed && <div style={{ fontSize: 13, color: "#3A3529", marginTop: 6 }}>75%に届きませんでした。補強学習をしてから再テストしてください。</div>}
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            {!session.result.passed && (
+              <button onClick={onRemedial} disabled={loading} style={ghostBtnWide}>{loading ? "準備中..." : "補強学習に進む"}</button>
+            )}
+            <button onClick={onFinish} style={primaryBtn(false)}>完了</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [view, setView] = useState("write"); // write | drill | freewrite | history | settings
   const [proxyUrlPresent, setProxyUrlPresent] = useState(!!getProxyUrl());
@@ -1191,6 +1360,8 @@ function App() {
   const [showExport, setShowExport] = useState(false);
   const [session, setSession] = useState(null);
   const [drillReady, setDrillReady] = useState(false);
+  // Phase 5: Final Check専用セッション(通常のsession/DrillSessionとは別に管理。10点方式のため)
+  const [finalCheckSession, setFinalCheckSession] = useState(null);
 
   // freewrite state
   const [freeWriteState, setFreeWriteState] = useState({ lastTs: null, usedThemes: [] });
@@ -1397,7 +1568,7 @@ function App() {
     return weightedSample(pool, e => (drillState.elementStats[e.id]?.mistakes || 0) + 1, 10);
   }
 
-  const TOPIC_BASED_ROUNDS = ["daily", "support"];
+  const TOPIC_BASED_ROUNDS = ["daily", "support", "finalCheckRemedial"];
 
   async function startRound(round, elements) {
     setDrillError("");
@@ -1458,9 +1629,123 @@ function App() {
   }
 
   function finishDailySession() {
-    // Today's Five/Support は自動連鎖しない。誤答があっても「完了」で単純に終了する
+    // Today's Five/Support/finalCheckRemedial は自動連鎖しない。誤答があっても「完了」で単純に終了する
     // (Supportへ進むかどうかはユーザーが明示的にボタンを押した場合のみ)。
     setSession(null);
+  }
+
+  // ---------- Phase 5: FINAL CHECK ----------
+  async function startFinalCheck() {
+    const lessonId = drillState.currentLessonId;
+    if (!lessonId) return;
+    setDrillError("");
+    setDrillWarning("");
+    setDrillLoading(true);
+    const { currentTopics, pastTopics } = pickFinalCheckTopics(drillState);
+    const allTopics = [...currentTopics, ...pastTopics];
+    const elements = allTopics.map(topicToElement);
+    const classificationList = ALL_TOPICS.map(t => ({ id: t.topicId, label: t.topicName }));
+    const pastAttempts = (drillState.finalCheckAttempts && drillState.finalCheckAttempts[lessonId]) || [];
+    const avoidJapanese = pastAttempts.slice(-5).flatMap(a => a.usedJapanese || []);
+    try {
+      const probs = await generateFinalCheckProblems(elements, avoidJapanese);
+      if (!Array.isArray(probs) || probs.length !== elements.length) {
+        throw new Error("problem count mismatch: expected " + elements.length + ", got " + (probs && probs.length));
+      }
+      const problems = probs.map(p => ({ ...p, userAnswer: "" }));
+      setFinalCheckSession({ lessonId, stage: "answering", problems, usedFallback: false, classificationList });
+    } catch (e) {
+      console.error("generateFinalCheckProblems failed, using fallback bank", e);
+      const problems = getFallbackProblemsForTopics(elements).map(p => ({ ...p, userAnswer: "" }));
+      setFinalCheckSession({ lessonId, stage: "answering", problems, usedFallback: true, classificationList });
+      setDrillWarning("AIによる問題生成が一時的にできなかったため、予備の問題セットを表示しています。");
+    }
+    setDrillLoading(false);
+  }
+
+  function updateFinalCheckAnswer(i, val) {
+    setFinalCheckSession(s => {
+      const problems = s.problems.slice();
+      problems[i] = { ...problems[i], userAnswer: val };
+      return { ...s, problems };
+    });
+  }
+
+  async function submitFinalCheckAnswers() {
+    setDrillLoading(true);
+    setDrillError("");
+    try {
+      const graded = await gradeFinalCheckAnswers(finalCheckSession.problems, finalCheckSession.classificationList);
+      const capped = graded.map(g => capFinalCheckScore(g));
+      const problems = finalCheckSession.problems.map((p, i) => ({
+        ...p,
+        score: capped[i].score,
+        cappedScore: capped[i].cappedScore,
+        targetSkillAssessment: capped[i].targetSkillAssessment,
+        usedTargetSkill: capped[i].usedTargetSkill,
+        correctedText: graded[i].correctedText,
+        feedback: graded[i].feedback,
+      }));
+      const result = computeFinalCheckResult(problems.map(p => p.cappedScore));
+      const lessonId = finalCheckSession.lessonId;
+
+      // アプリ側の決定ロジック: PASS/FAIL・状態遷移・次Lesson解放はここでのみ決定する(AIには一切尋ねない)
+      let lessonStates = { ...(drillState.lessonStates || {}) };
+      const curLessonState = lessonStates[lessonId] || { lessonId, status: LESSON_STATUS.LEARNING_COMPLETE };
+      let nextInfo = { nextLessonId: null, isLastLesson: false };
+      if (result.passed) {
+        lessonStates = { ...lessonStates, [lessonId]: { ...curLessonState, status: LESSON_STATUS.MASTERED } };
+        const unlocked = unlockNextLessonIfNeeded(lessonStates, lessonId);
+        lessonStates = unlocked.lessonStates;
+        nextInfo = { nextLessonId: unlocked.nextLessonId, isLastLesson: unlocked.isLastLesson };
+      } else {
+        // REMEDIAL維持(補強学習だけではLEARNING_COMPLETEへ戻さない。再Final Check合格時のみMASTEREDへ)
+        lessonStates = { ...lessonStates, [lessonId]: { ...curLessonState, status: LESSON_STATUS.REMEDIAL } };
+      }
+
+      const attemptRecord = {
+        ts: Date.now(), totalScore: result.totalScore, maxScore: result.maxScore,
+        percentage: result.percentage, passed: result.passed,
+        topicIds: problems.map(p => p.elementId),
+        usedJapanese: problems.map(p => p.japanese),
+      };
+      const prevAttempts = (drillState.finalCheckAttempts && drillState.finalCheckAttempts[lessonId]) || [];
+      const finalCheckAttempts = {
+        ...(drillState.finalCheckAttempts || {}),
+        [lessonId]: [...prevAttempts, attemptRecord].slice(-5),
+      };
+
+      const nextDrillState = {
+        ...drillState, lessonStates, finalCheckAttempts,
+        currentLessonId: (result.passed && nextInfo.nextLessonId) ? nextInfo.nextLessonId : drillState.currentLessonId,
+      };
+      saveDrillState(nextDrillState);
+      appendDrillLog(problems.map(p => ({
+        ts: Date.now(), round: finalCheckSession.usedFallback ? "finalCheck" : "finalCheck",
+        sourceType: "finalCheck", topicId: p.elementId, elementId: p.elementId, lessonId,
+        japanese: p.japanese, userAnswer: p.userAnswer, score: p.score, cappedScore: p.cappedScore,
+        targetSkillAssessment: p.targetSkillAssessment, correct: p.cappedScore >= 7,
+      })));
+
+      setFinalCheckSession({ ...finalCheckSession, stage: "result", problems, result, isLastLesson: nextInfo.isLastLesson });
+    } catch (e) {
+      setDrillError("採点に失敗しました。もう一度お試しください。");
+    }
+    setDrillLoading(false);
+  }
+
+  function finishFinalCheck() {
+    setFinalCheckSession(null);
+  }
+
+  // 不合格時の補強学習。Phase 4のSupportと同じ出題パイプラインを再利用する(新しいWeakness DBは作らない)。
+  async function startFinalCheckRemedial() {
+    const wrong = finalCheckSession.problems.filter(p => p.cappedScore < 7);
+    const uniqueTopicIds = [...new Set(wrong.map(p => p.elementId))];
+    const remedialTopics = uniqueTopicIds.map(id => TOPIC_MAP[id]).filter(Boolean);
+    if (remedialTopics.length === 0) { setFinalCheckSession(null); return; }
+    setFinalCheckSession(null);
+    await startRound("finalCheckRemedial", remedialTopics.map(topicToElement));
   }
 
   function updateAnswer(i, val) {
@@ -1485,19 +1770,21 @@ function App() {
       }));
 
       if (TOPIC_BASED_ROUNDS.includes(session.round)) {
-        // Phase 4: Today's Five / Support — TopicProgressを更新する(旧elementStatsには一切触れない)
-        const isSupport = session.round === "support";
+        // Phase 4/5: Today's Five / Support / finalCheckRemedial — TopicProgressを更新する(旧elementStatsには一切触れない)
+        // 「daily」だけがplannedExposureCount(Coverage算入)を更新し、それ以外(support/finalCheckRemedial)は
+        // supportExposureCountのみを更新する(Coverageには影響しない)。
+        const isPlanned = session.round === "daily";
         const nowIso = new Date().toISOString();
         const topicProgress = { ...(drillState.topicProgress || {}) };
         problems.forEach(p => {
           const tid = p.elementId;
           const cur = topicProgress[tid] || createEmptyTopicProgress();
-          topicProgress[tid] = isSupport
-            ? { ...cur, supportExposureCount: cur.supportExposureCount + 1, lastSupportExposureAt: nowIso }
-            : { ...cur, plannedExposureCount: cur.plannedExposureCount + 1, lastPlannedExposureAt: nowIso };
+          topicProgress[tid] = isPlanned
+            ? { ...cur, plannedExposureCount: cur.plannedExposureCount + 1, lastPlannedExposureAt: nowIso }
+            : { ...cur, supportExposureCount: cur.supportExposureCount + 1, lastSupportExposureAt: nowIso };
         });
         let lessonStates = { ...(drillState.lessonStates || {}) };
-        if (!isSupport && drillState.currentLessonId) {
+        if (isPlanned && drillState.currentLessonId) {
           const cov = computeLessonCoverage(drillState.currentLessonId, topicProgress);
           if (cov.coverageRate >= 1) {
             const cur = lessonStates[drillState.currentLessonId] || { lessonId: drillState.currentLessonId, status: LESSON_STATUS.LEARNING };
@@ -1508,7 +1795,7 @@ function App() {
         }
         saveDrillState({ ...drillState, topicProgress, lessonStates });
         appendDrillLog(problems.map(p => ({
-          ts: Date.now(), round: session.round, sourceType: isSupport ? "support" : "today",
+          ts: Date.now(), round: session.round, sourceType: isPlanned ? "today" : session.round,
           topicId: p.elementId, elementId: p.elementId, japanese: p.japanese,
           userAnswer: p.userAnswer, correct: p.correct, mistakeElementId: p.mistakeElementId,
         })));
@@ -1674,10 +1961,16 @@ function App() {
                 <button onClick={() => saveDrillState(drillState)} style={{ ...ghostBtn, whiteSpace: "nowrap" }}>今すぐ再送信</button>
               </div>
             )}
-            {!session && (() => {
+            {!session && !finalCheckSession && (() => {
               const lesson = LESSON_MAP[drillState.currentLessonId];
+              const lessonState = lesson && drillState.lessonStates && drillState.lessonStates[lesson.lessonId];
+              const status = lessonState ? lessonState.status : LESSON_STATUS.LEARNING;
               const cov = lesson ? computeLessonCoverage(lesson.lessonId, drillState.topicProgress || {}) : { totalRequiredTopics: 0, coveredRequiredTopics: 0, coverageRate: 0 };
-              const isDone = !!lesson && cov.coverageRate >= 1;
+              const isLearningComplete = status === LESSON_STATUS.LEARNING_COMPLETE;
+              const isRemedial = status === LESSON_STATUS.REMEDIAL;
+              const isMastered = status === LESSON_STATUS.MASTERED;
+              const isLastLesson = !!lesson && LESSONS[LESSONS.length - 1].lessonId === lesson.lessonId;
+              const todayBlocked = isLearningComplete || isRemedial || isMastered;
               return (
                 <div>
                   <div style={{ ...cardStyle, marginBottom: 12 }}>
@@ -1692,16 +1985,27 @@ function App() {
                     <div style={{ height: 6, background: "#E7E0CE", borderRadius: 3, marginTop: 8, overflow: "hidden" }}>
                       <div style={{ width: (cov.coverageRate * 100) + "%", height: "100%", background: "linear-gradient(90deg,#B23A2E,#C9A227)" }} />
                     </div>
-                    {isDone && (
-                      <div style={{ fontSize: 12, color: "#C9A227", marginTop: 8 }}>
-                        🚧 このLessonの新規学習は完了しました。講末確認テストは現在開発中です(近日、正式な確認テストへの導線に置き換わります)。
-                      </div>
+                    {isLearningComplete && (
+                      <div style={{ fontSize: 12, color: "#C9A227", marginTop: 8 }}>✅ 新規学習が完了しました。講末確認テストを受けられます。</div>
+                    )}
+                    {isRemedial && (
+                      <div style={{ fontSize: 12, color: "#B23A2E", marginTop: 8 }}>前回の講末確認テストは不合格でした。補強学習をしてから再テストしてください。</div>
+                    )}
+                    {isMastered && isLastLesson && (
+                      <div style={{ fontSize: 12, color: "#2F5D50", marginTop: 8 }}>🎉 全カリキュラムを修了しました！</div>
                     )}
                   </div>
                   <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
-                    <button onClick={startDaily} disabled={drillLoading || isDone} style={primaryBtn(drillLoading || isDone)}>{drillLoading ? "準備中..." : "今日の5問"}</button>
+                    <button onClick={startDaily} disabled={drillLoading || todayBlocked} style={primaryBtn(drillLoading || todayBlocked)}>{drillLoading ? "準備中..." : "今日の5問"}</button>
                     <button onClick={startWeekly} disabled={drillLoading || Object.keys(drillState.elementStats).length === 0} style={ghostBtnWide}>週次演習(10問)</button>
                   </div>
+                  {(isLearningComplete || isRemedial) && (
+                    <div style={{ marginBottom: 14 }}>
+                      <button onClick={startFinalCheck} disabled={drillLoading} style={primaryBtn(drillLoading)}>
+                        {drillLoading ? "準備中..." : (isRemedial ? "再テストする" : "講末確認テストを受ける")}
+                      </button>
+                    </div>
+                  )}
                   {masteryList.length > 0 && (
                     <div style={cardStyle}>
                       <div style={labelStyle}>要素別 定着度(誤答率が高い順)</div>
@@ -1723,7 +2027,7 @@ function App() {
                     {showExport && (
                       <textarea
                         readOnly
-                        value={JSON.stringify({ currentLessonId: drillState.currentLessonId, lessonStates: drillState.lessonStates, topicProgress: drillState.topicProgress, progressPointer: drillState.progressPointer, elementStats: drillState.elementStats }, null, 2)}
+                        value={JSON.stringify({ currentLessonId: drillState.currentLessonId, lessonStates: drillState.lessonStates, topicProgress: drillState.topicProgress, finalCheckAttempts: drillState.finalCheckAttempts, progressPointer: drillState.progressPointer, elementStats: drillState.elementStats }, null, 2)}
                         onFocus={(e) => e.target.select()}
                         style={{ width: "100%", minHeight: 140, marginTop: 8, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, color: "#3A3529", border: "1px solid #E7E0CE", borderRadius: 6, padding: 8, boxSizing: "border-box", background: "#FAF6EC" }}
                       />
@@ -1737,8 +2041,18 @@ function App() {
                 session={session}
                 onAnswerChange={updateAnswer}
                 onSubmit={submitSession}
-                onFinish={(session.round === "daily" || session.round === "support") ? finishDailySession : finishSession}
+                onFinish={TOPIC_BASED_ROUNDS.includes(session.round) ? finishDailySession : finishSession}
                 onSupport={session.round === "daily" ? startSupportRound : undefined}
+                loading={drillLoading}
+              />
+            )}
+            {finalCheckSession && (
+              <FinalCheckSession
+                session={finalCheckSession}
+                onAnswerChange={updateFinalCheckAnswer}
+                onSubmit={submitFinalCheckAnswers}
+                onFinish={finishFinalCheck}
+                onRemedial={startFinalCheckRemedial}
                 loading={drillLoading}
               />
             )}
