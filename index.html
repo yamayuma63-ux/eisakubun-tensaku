@@ -330,47 +330,174 @@ function getFallbackProblems(elements) {
   });
 }
 
-// ---------- Phase 2: Curriculum Engine — Lesson / Topic schema (MASTER_SPEC PART 3) ----------
-// 既存の CURRICULUM / ELEMENT_MAP / FALLBACK_PROBLEMS の内容には一切手を加えていない。
-// ここではそれらから正式スキーマ(Lesson→Topic[])を導出するのみで、
-// 項目の追加・削除・順序変更・先取りは行っていない(MASTER_SPEC §6)。
-// 「今日の5問」「週次演習」等、既存の出題ロジックはこのブロックの影響を受けない(未接続)。
+// ---------- Phase 2.5: Curriculum Refinement — 11 Lesson → 26 Topic (MASTER_SPEC PART 3) ----------
+// Design Review(ユーザー承認済み)に基づき、Phase 2の「1 Lesson = 1 Topic」を廃止し、
+// 各Lessonを意味的なまとまりで2〜3個のTopicへ再分割する。
+// 既存の CURRICULUM / FALLBACK_PROBLEMS の文言・内容は一切変更せず、
+// それらの要素(targetGrammarの分割項目・和文例)をどのTopicに割り当てるかを整理するのみ
+// (新しい文法説明や例文の創作は行っていない)。
+// 「今日の5問」「週次演習」等、既存の出題ロジックはこのブロックの影響を受けない(未接続のまま)。
+
+const REQUIRED_EXPOSURES_DEFAULT = 2; // Topic単位のCoverage閾値の初期値(Topicごとに上書き可能)
+
+// 各Lessonをどう分割するか。grammarIdx/exampleIdxは、CURRICULUM.descの分割結果・
+// FALLBACK_PROBLEMSの配列に対する「何番目の要素を採用するか」のインデックス参照。
+const TOPIC_GROUPS = {
+  L01: [
+    { suffix: "T1", name: "tell/say/expressの使い分け", grammarIdx: [0, 1, 5], exampleIdx: [0, 1, 4, 6, 9, 11, 12] },
+    { suffix: "T2", name: "speak/talk/discussの使い分け", grammarIdx: [2, 3, 4], exampleIdx: [2, 3, 5, 7, 13] },
+    { suffix: "T3", name: "伝聞構文(be said to / it is said that)", grammarIdx: [6, 7], exampleIdx: [8, 10] },
+  ],
+  L02: [
+    { suffix: "T1", name: "look/sound/feel+C・like・as if", grammarIdx: [2, 3, 4, 5, 6, 7, 9], exampleIdx: [0, 2, 3, 4, 5, 6, 7, 8, 13] },
+    { suffix: "T2", name: "知覚動詞(feel/hear/see O doing)", grammarIdx: [0, 1, 8], exampleIdx: [1, 9] },
+    { suffix: "T3", name: "認識動詞(understand/realize/recognize/find)", grammarIdx: [10, 11, 12], exampleIdx: [10, 11, 12] },
+  ],
+  L03: [
+    { suffix: "T1", name: "make/have/letの使い分け(能動)", grammarIdx: [0, 1, 2], exampleIdx: [0, 1, 2, 8, 12, 13] },
+    { suffix: "T2", name: "have[get] O done(依頼・被害・完了)", grammarIdx: [4, 5, 6], exampleIdx: [4, 5, 6] },
+    { suffix: "T3", name: "受動の使役・keep/leave/help", grammarIdx: [3, 7, 8, 9, 10], exampleIdx: [3, 7, 9, 10, 11] },
+  ],
+  L05: [
+    { suffix: "T1", name: "初回・強調構文(for the first time, not...until)", grammarIdx: [0, 1], exampleIdx: [0, 1, 2, 10] },
+    { suffix: "T2", name: "期限・時制選択(until/by, 過去完了等)", grammarIdx: [2, 3, 4, 5, 6, 7, 8], exampleIdx: [3, 4, 5, 6, 7, 8, 9, 11, 12, 13] },
+  ],
+  L06: [
+    { suffix: "T1", name: "受動態の時制(進行・完了)", grammarIdx: [0, 1], exampleIdx: [0, 1, 2, 11] },
+    { suffix: "T2", name: "完了形・過去完了の使い分け", grammarIdx: [2, 3, 4, 5, 6, 7], exampleIdx: [3, 4, 5, 6, 7, 8, 9, 10, 12] },
+  ],
+  L07: [
+    { suffix: "T1", name: "become系(become/get/grow/turn into)", grammarIdx: [0, 1, 2, 3], exampleIdx: [0, 1, 2, 3, 10, 11, 12, 13] },
+    { suffix: "T2", name: "過程動詞(come to/begin to/learn to)", grammarIdx: [4, 5, 6], exampleIdx: [4, 5, 6] },
+    { suffix: "T3", name: "帰結表現(end up/mean that)", grammarIdx: [7, 8, 9], exampleIdx: [7, 8, 9] },
+  ],
+  L09: [
+    { suffix: "T1", name: "there is/areの基本", grammarIdx: [0, 4], exampleIdx: [0, 1, 5, 6, 8, 10, 11, 12, 13] },
+    { suffix: "T2", name: "応用構文(remain to be done, lie in等)", grammarIdx: [1, 2, 3, 5, 6], exampleIdx: [2, 3, 4, 7, 9] },
+  ],
+  L10: [
+    { suffix: "T1", name: "形式主語It is...to do", grammarIdx: [0, 1, 2], exampleIdx: [0, 1, 2] },
+    { suffix: "T2", name: "名詞節(what/whether)・慣用構文", grammarIdx: [3, 4, 5, 6, 7], exampleIdx: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12] },
+  ],
+  L11: [
+    { suffix: "T1", name: "傾向・評価構文(be apt to, it is 形容詞 of A)", grammarIdx: [0, 2, 3, 5], exampleIdx: [0, 1, 3, 4, 7, 9, 10, 12, 13] },
+    { suffix: "T2", name: "tough構文・重要性構文", grammarIdx: [1, 4, 6], exampleIdx: [2, 5, 6, 8, 11] },
+  ],
+  L13: [
+    { suffix: "T1", name: "原級・比較級の基本", grammarIdx: [0, 1], exampleIdx: [0, 1, 2, 3, 4, 5, 6, 9] },
+    { suffix: "T2", name: "最上級相当表現", grammarIdx: [2, 3, 4, 5, 6, 7], exampleIdx: [7, 8, 10, 11, 12] },
+  ],
+  L14: [
+    { suffix: "T1", name: "倍数・相関表現(times as~as, the比較級 the比較級)", grammarIdx: [0, 1], exampleIdx: [0, 1, 2, 5, 11] },
+    { suffix: "T2", name: "慣用比較表現(as~as possible等)", grammarIdx: [2, 3, 4, 5], exampleIdx: [3, 4, 6, 7, 8, 9, 10, 12] },
+  ],
+};
+
 const LESSONS = CURRICULUM.map((el, index) => {
   const grammarTerms = el.desc.split(/[、･・]/).map(s => s.trim()).filter(Boolean);
-  const sourceExamples = (FALLBACK_PROBLEMS[el.id] || []).map(p => p.japanese);
-  return {
-    lessonId: el.id,
-    lessonOrder: index,
-    lessonTitle: el.label,
-    topics: [
-      {
-        topicId: el.id + "-T1",
-        lessonId: el.id,
-        topicName: el.label,
-        targetGrammar: grammarTerms,
-        targetExpressions: [],
-        explanation: el.desc,
-        sourceExamples: sourceExamples,
-        required: true,
-      },
-    ],
-  };
+  const examples = (FALLBACK_PROBLEMS[el.id] || []).map(p => p.japanese);
+  const groups = TOPIC_GROUPS[el.id] || [{ suffix: "T1", name: el.label, grammarIdx: grammarTerms.map((_, i) => i), exampleIdx: examples.map((_, i) => i) }];
+  const topics = groups.map(g => {
+    const targetGrammar = g.grammarIdx.map(i => grammarTerms[i]).filter(Boolean);
+    return {
+      topicId: `${el.id}-${g.suffix}`,
+      lessonId: el.id,
+      topicName: g.name,
+      targetGrammar,
+      targetExpressions: [],
+      explanation: targetGrammar.join("、"),
+      sourceExamples: g.exampleIdx.map(i => examples[i]).filter(Boolean),
+      required: true,
+      requiredExposures: REQUIRED_EXPOSURES_DEFAULT,
+    };
+  });
+  return { lessonId: el.id, lessonOrder: index, lessonTitle: el.label, topics };
 });
 const LESSON_MAP = Object.fromEntries(LESSONS.map(l => [l.lessonId, l]));
+const ALL_TOPICS = LESSONS.flatMap(l => l.topics);
+const TOPIC_MAP = Object.fromEntries(ALL_TOPICS.map(t => [t.topicId, t]));
 
-// Coverage計算(MASTER_SPEC §9)。既存の elementStats(attempts) を用いた読み取り専用の集計であり、
-// 出題・解放・進級など既存の判定ロジックには一切接続していない(Phase 4/5で正式に接続予定)。
-function computeLessonCoverage(lessonId, elementStats) {
+// ---------- LessonState / TopicProgress schema ----------
+const LESSON_STATUS = {
+  LOCKED: "LOCKED",
+  LEARNING: "LEARNING",
+  LEARNING_COMPLETE: "LEARNING_COMPLETE",
+  REMEDIAL: "REMEDIAL",
+  MASTERED: "MASTERED",
+};
+
+function createEmptyTopicProgress() {
+  return {
+    plannedExposureCount: 0,   // Today's Five(計画的新規学習)による露出回数。Coverage判定に使う
+    supportExposureCount: 0,   // Support(当日の理解補助)による露出回数。Coverageには使わない
+    lastPlannedExposureAt: null,
+    lastSupportExposureAt: null,
+  };
+}
+
+// Topic単位のCoverage判定: plannedExposureCount のみを見る(Support/Reviewは含めない)
+function isTopicCovered(topic, progress) {
+  const p = progress || createEmptyTopicProgress();
+  const threshold = topic.requiredExposures || REQUIRED_EXPOSURES_DEFAULT;
+  return p.plannedExposureCount >= threshold;
+}
+
+// Lesson単位のCoverage集計(MASTER_SPEC §9)。topicProgressMap: { [topicId]: TopicProgress }
+// 出題・解放・進級ロジックへはまだ接続していない(Phase 4で接続予定)。
+function computeLessonCoverage(lessonId, topicProgressMap) {
   const lesson = LESSON_MAP[lessonId];
   if (!lesson) return { totalRequiredTopics: 0, coveredRequiredTopics: 0, coverageRate: 0 };
   const requiredTopics = lesson.topics.filter(t => t.required);
   const totalRequiredTopics = requiredTopics.length;
-  const coveredRequiredTopics = requiredTopics.filter(() => {
-    const stat = elementStats && elementStats[lessonId];
-    return !!(stat && stat.attempts > 0);
-  }).length;
+  const coveredRequiredTopics = requiredTopics.filter(t => isTopicCovered(t, topicProgressMap && topicProgressMap[t.topicId])).length;
   const coverageRate = totalRequiredTopics > 0 ? coveredRequiredTopics / totalRequiredTopics : 0;
   return { totalRequiredTopics, coveredRequiredTopics, coverageRate };
+}
+
+// ---------- Migration: 旧 drillState(progressPointer等) → 新 LessonState/TopicProgress ----------
+// 保守的方針(ユーザー承認済み):
+//   - 未来Lessonを誤ってMASTERED扱いしない
+//   - 手前のLessonは LEARNING_COMPLETE に留める(MASTEREDにはしない。Final Check未実施のため)
+//   - 現在Lessonは新しい粒度で LEARNING から再開(topicProgressは空に戻す)
+//   - 先のLessonは LOCKED
+// 純粋関数(副作用・localStorage書き込みなし)。Phase 2.5では呼び出し元を実装せず、
+// Phase 4でTodai's Fiveの状態管理に接続する際に初めて実行する。
+function migrateToLessonProgress(oldDrillState) {
+  const n = LESSONS.length;
+  const oldPointer = (oldDrillState && typeof oldDrillState.progressPointer === "number") ? oldDrillState.progressPointer : 0;
+  const roughLessonIndex = n > 0 ? Math.floor(oldPointer) % n : 0;
+
+  const lessonStates = {};
+  const topicProgress = {};
+
+  LESSONS.forEach((lesson, idx) => {
+    let status;
+    if (idx < roughLessonIndex) status = LESSON_STATUS.LEARNING_COMPLETE;
+    else if (idx === roughLessonIndex) status = LESSON_STATUS.LEARNING;
+    else status = LESSON_STATUS.LOCKED;
+    lessonStates[lesson.lessonId] = { lessonId: lesson.lessonId, status };
+
+    lesson.topics.forEach(topic => {
+      if (idx < roughLessonIndex) {
+        // 旧システムで繰り返し露出済みという解釈のもと、Coverage閾値まで満たしておく
+        // (Final Checkはいつでも受けられる状態にするが、MASTEREDには絶対にしない)
+        topicProgress[topic.topicId] = {
+          plannedExposureCount: topic.requiredExposures || REQUIRED_EXPOSURES_DEFAULT,
+          supportExposureCount: 0,
+          lastPlannedExposureAt: null,
+          lastSupportExposureAt: null,
+        };
+      } else {
+        topicProgress[topic.topicId] = createEmptyTopicProgress();
+      }
+    });
+  });
+
+  return {
+    lessonStates,
+    topicProgress,
+    currentLessonId: LESSONS[roughLessonIndex] ? LESSONS[roughLessonIndex].lessonId : null,
+  };
 }
 
 // ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
@@ -381,7 +508,7 @@ function computeLessonCoverage(lessonId, elementStats) {
 // 英作文での使いどころ→注意点→典型的ミス→関連表現)に沿って、Phase 2の11 Topicすべてに対応させる。
 const GRAMMAR_MINI_LESSONS = [
   {
-    id: "L01-T1", lessonId: "L01",
+    id: "L01", lessonId: "L01",
     tool: "「伝える」動詞の使い分け(tell / say / talk / speak / discuss / express)",
     rule: "tellは相手(目的語)を伴う他動詞、sayは伝達内容を目的語に取る。talk/speakは基本的に自動詞で、話題を続けるにはaboutが必要。discussは他動詞でaboutを置かない。",
     example: `He told me about his plan. / He didn't say what he thought. / We discussed the plan.(× discussed about the plan)`,
@@ -391,7 +518,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["express the view that", "it is said that", "talk O over", "tell O to do"],
   },
   {
-    id: "L02-T1", lessonId: "L02",
+    id: "L02", lessonId: "L02",
     tool: "知覚・認識動詞の型の使い分け(look/feel/sound + C、feel O doing、find (that) SV)",
     rule: "look/sound/feelは形容詞を補語に取る自動詞(look C)。feelにはfeel O doing(他動詞・知覚)という用法もある。find (that) SVは「〜だとわかる」。",
     example: "She looked satisfied with the result. / I felt the ground shake. / I found that the plan was unrealistic.",
@@ -401,7 +528,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["look as if SV", "find oneself doing", "sound like A", "come to realize"],
   },
   {
-    id: "L03-T1", lessonId: "L03",
+    id: "L03", lessonId: "L03",
     tool: "使役動詞make/have/let/getの使い分け",
     rule: "make=強制、have=依頼(人主語)、let=許可、getはto不定詞を伴う依頼・完了。受動態にできるのはmakeのみで、be made to doとto不定詞が必要になる。",
     example: "The rule made us wait outside. / I had my brother fix the printer. / They let students choose their own topics.",
@@ -411,7 +538,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["have O done", "help O (to) do", "keep O doing"],
   },
   {
-    id: "L05-T1", lessonId: "L05",
+    id: "L05", lessonId: "L05",
     tool: "初回・期限・限定の時間表現(for the first time / not...until / by・until)",
     rule: "for the first time=初めて。not...until~=〜してようやく…する。until=継続の終点。by=期限(その時点までに完了)。",
     example: "It was not until she moved abroad that she realized the value of her hometown.",
@@ -421,7 +548,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["it is not until ~ that", "by the time SV", "once SV"],
   },
   {
-    id: "L06-T1", lessonId: "L06",
+    id: "L06", lessonId: "L06",
     tool: "完了・進行の受動態と時間軸の整理(have been done / had been doing / by the time)",
     rule: "受動の進行形=be being done。受動の完了形=have been done。過去完了は「過去のある時点までに完了・継続していたこと」を表す。",
     example: "A new library is being built near the station. / By the time he arrived, the meeting had already started.",
@@ -431,7 +558,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["by the time SV", "have been done", "It has been A since SV"],
   },
   {
-    id: "L07-T1", lessonId: "L07",
+    id: "L07", lessonId: "L07",
     tool: "変化を表す動詞の使い分け(become / get / grow / turn into / come to do)",
     rule: "become/get/growは形容詞・名詞を補語に取る。turn intoは名詞への質的変化、come to doは徐々にそうなる過程を表す。",
     example: "Attitudes toward remote work have gradually come to change. / Plastic waste turns into a serious environmental problem.",
@@ -441,7 +568,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["end up doing", "begin to do", "the number of A is increasing"],
   },
   {
-    id: "L09-T1", lessonId: "L09",
+    id: "L09", lessonId: "L09",
     tool: "there is/are構文と存在・分布の書き方",
     rule: "there is/areは新情報の存在を導入する。remain to be doneは「まだ〜されていない」。lie in Aは位置を表す。",
     example: "There are still many challenges to be addressed regarding AI regulation.",
@@ -451,7 +578,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["there is no point in doing", "remain to be done", "there are likely to be"],
   },
   {
-    id: "L10-T1", lessonId: "L10",
+    id: "L10", lessonId: "L10",
     tool: "形式主語構文と名詞節による抽象化(It is ... to do / what SV is that SV)",
     rule: "It is + 形容詞 + to do で動名詞主語の代わりに簡潔に書ける。what SV is that SVは「重要なのは〜ということだ」を強調する。",
     example: "It is essential for governments to invest in renewable energy. / What matters most is how we respond to failure.",
@@ -461,7 +588,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["the trouble with A is that", "it doesn't matter wh-", "whether... or not"],
   },
   {
-    id: "L11-T1", lessonId: "L11",
+    id: "L11", lessonId: "L11",
     tool: "傾向・評価を表す形容詞構文(be apt to do / it is 形容詞 of A to do)",
     rule: "be apt/liable to doは「〜しがちだ」という傾向、it is 形容詞 of A to doは人の性質を主観的に評価する構文。",
     example: "Teenagers are apt to underestimate long-term risks. / It was reckless of the company to ignore the warning.",
@@ -471,7 +598,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["seem to do", "easy/difficult to do(tough構文)", "it is 形容詞 for A to do"],
   },
   {
-    id: "L13-T1", lessonId: "L13",
+    id: "L13", lessonId: "L13",
     tool: "最上級相当表現による強調(no other A is as ~ as / never before have S been)",
     rule: "最上級は1文で言い切れるが、比較級・原級を使った最上級相当表現は「他のどれも及ばない」ことを強調でき、論証的な文体に向く。",
     example: "No other invention has changed communication as drastically as the smartphone.",
@@ -481,7 +608,7 @@ const GRAMMAR_MINI_LESSONS = [
     relatedExpressions: ["the +最上級+of all", "as+原級+as possible", "such a+形容詞+名詞+as"],
   },
   {
-    id: "L14-T1", lessonId: "L14",
+    id: "L14", lessonId: "L14",
     tool: "比例・倍数表現による量的変化の記述(the+比較級, the+比較級 / X times as ~ as)",
     rule: "the 比較級, the 比較級は「〜すればするほど…」という相関関係、X times as ~ asは倍数表現。",
     example: "The more automated a task becomes, the fewer people are needed to perform it.",
