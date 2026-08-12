@@ -373,6 +373,325 @@ function computeLessonCoverage(lessonId, elementStats) {
   return { totalRequiredTopics, coveredRequiredTopics, coverageRate };
 }
 
+// ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
+// 静的コンテンツのみ。AI呼び出し・localStorage・既存UIには一切接続しない(閲覧用データ層のみ)。
+// Grammar系は Phase 2 の LESSONS/Topic と1対1対応。Logic/Vocabularyは講に依存しない独立教材。
+
+// (A) Grammar / Structure Mini Lessons — §12のフォーマット(TODAY'S TOOL→基本ルール→Example→
+// 英作文での使いどころ→注意点→典型的ミス→関連表現)に沿って、Phase 2の11 Topicすべてに対応させる。
+const GRAMMAR_MINI_LESSONS = [
+  {
+    id: "L01-T1", lessonId: "L01",
+    tool: "「伝える」動詞の使い分け(tell / say / talk / speak / discuss / express)",
+    rule: "tellは相手(目的語)を伴う他動詞、sayは伝達内容を目的語に取る。talk/speakは基本的に自動詞で、話題を続けるにはaboutが必要。discussは他動詞でaboutを置かない。",
+    example: `He told me about his plan. / He didn't say what he thought. / We discussed the plan.(× discussed about the plan)`,
+    usage: "自由英作文で「〜だと述べる/主張する」を書く際、say that SV / express the view that SV / it is said that SV を使い分けると単調さを避けられる。",
+    caution: "discussの後にaboutを置かない。talk/speakは目的語に話題を直接取れず、talk about Aの形が必要。",
+    commonMistake: `"discuss about" "talk something" のような前置詞の付け忘れ・余分な付与。`,
+    relatedExpressions: ["express the view that", "it is said that", "talk O over", "tell O to do"],
+  },
+  {
+    id: "L02-T1", lessonId: "L02",
+    tool: "知覚・認識動詞の型の使い分け(look/feel/sound + C、feel O doing、find (that) SV)",
+    rule: "look/sound/feelは形容詞を補語に取る自動詞(look C)。feelにはfeel O doing(他動詞・知覚)という用法もある。find (that) SVは「〜だとわかる」。",
+    example: "She looked satisfied with the result. / I felt the ground shake. / I found that the plan was unrealistic.",
+    usage: `自由英作文で調査結果や印象を述べる際、"It seems that" だけでなくlook/find/feelを使い分けると表現の幅が出る。`,
+    caution: "look like の後は名詞、look as if の後はSV。混同しやすい。",
+    commonMistake: `"look like SV" のように後ろに節を続けてしまう誤り。`,
+    relatedExpressions: ["look as if SV", "find oneself doing", "sound like A", "come to realize"],
+  },
+  {
+    id: "L03-T1", lessonId: "L03",
+    tool: "使役動詞make/have/let/getの使い分け",
+    rule: "make=強制、have=依頼(人主語)、let=許可、getはto不定詞を伴う依頼・完了。受動態にできるのはmakeのみで、be made to doとto不定詞が必要になる。",
+    example: "The rule made us wait outside. / I had my brother fix the printer. / They let students choose their own topics.",
+    usage: "「〜させる/〜してもらう」を強制・依頼・許可の段階で区別して書き分けると、自由英作文で意図が正確に伝わる。",
+    caution: "受動態にするとmakeだけto doが必要になる(He was made to apologize.)。have/letは受動で使われにくい。",
+    commonMistake: "letの後にto doを置いてしまう誤り(× let him to go)。",
+    relatedExpressions: ["have O done", "help O (to) do", "keep O doing"],
+  },
+  {
+    id: "L05-T1", lessonId: "L05",
+    tool: "初回・期限・限定の時間表現(for the first time / not...until / by・until)",
+    rule: "for the first time=初めて。not...until~=〜してようやく…する。until=継続の終点。by=期限(その時点までに完了)。",
+    example: "It was not until she moved abroad that she realized the value of her hometown.",
+    usage: "「〜して初めて…に気づいた」という自由英作文の定番構成に使える強調構文。",
+    caution: "byとuntilの混同(byは動作の完了期限、untilは状態の継続)。",
+    commonMistake: `"until" を「〜までに」の意味で使ってしまう誤り。`,
+    relatedExpressions: ["it is not until ~ that", "by the time SV", "once SV"],
+  },
+  {
+    id: "L06-T1", lessonId: "L06",
+    tool: "完了・進行の受動態と時間軸の整理(have been done / had been doing / by the time)",
+    rule: "受動の進行形=be being done。受動の完了形=have been done。過去完了は「過去のある時点までに完了・継続していたこと」を表す。",
+    example: "A new library is being built near the station. / By the time he arrived, the meeting had already started.",
+    usage: "変化や結果を時系列で説明する自由英作文のBodyで、過去完了を使うと出来事の前後関係が明確になる。",
+    caution: "過去形と過去完了形の使い分け(基準となる時点があるかどうか)。",
+    commonMistake: "基準時点がないのに安易に過去完了を使ってしまう誤り。",
+    relatedExpressions: ["by the time SV", "have been done", "It has been A since SV"],
+  },
+  {
+    id: "L07-T1", lessonId: "L07",
+    tool: "変化を表す動詞の使い分け(become / get / grow / turn into / come to do)",
+    rule: "become/get/growは形容詞・名詞を補語に取る。turn intoは名詞への質的変化、come to doは徐々にそうなる過程を表す。",
+    example: "Attitudes toward remote work have gradually come to change. / Plastic waste turns into a serious environmental problem.",
+    usage: "社会や意識の「変化」を書く自由英作文の頻出表現。becomeを繰り返さないための言い換え手段になる。",
+    caution: "come to doは状態動詞と相性が良い(× come to running)。",
+    commonMistake: "turn intoの後に形容詞を置いてしまう誤り(turn intoは名詞が必要)。",
+    relatedExpressions: ["end up doing", "begin to do", "the number of A is increasing"],
+  },
+  {
+    id: "L09-T1", lessonId: "L09",
+    tool: "there is/are構文と存在・分布の書き方",
+    rule: "there is/areは新情報の存在を導入する。remain to be doneは「まだ〜されていない」。lie in Aは位置を表す。",
+    example: "There are still many challenges to be addressed regarding AI regulation.",
+    usage: "自由英作文の導入部で問題の存在を提示する際の定番構文。there is no denying thatなど意見表明にも展開できる。",
+    caution: "There is/are の後の名詞と動詞の一致(There is a problem / There are problems)。",
+    commonMistake: "There is many... のような単数・複数の不一致。",
+    relatedExpressions: ["there is no point in doing", "remain to be done", "there are likely to be"],
+  },
+  {
+    id: "L10-T1", lessonId: "L10",
+    tool: "形式主語構文と名詞節による抽象化(It is ... to do / what SV is that SV)",
+    rule: "It is + 形容詞 + to do で動名詞主語の代わりに簡潔に書ける。what SV is that SVは「重要なのは〜ということだ」を強調する。",
+    example: "It is essential for governments to invest in renewable energy. / What matters most is how we respond to failure.",
+    usage: "自由英作文の主張(Claim)を明確に打ち出す際、形式主語構文は主語を軽くして情報を後ろに置けるため読みやすい。",
+    caution: "It is 形容詞 of A to do(人の性質の評価)と for A to do(一般的な内容)の使い分け。",
+    commonMistake: "It is important for you to do を It is important of you to do のように誤用する。",
+    relatedExpressions: ["the trouble with A is that", "it doesn't matter wh-", "whether... or not"],
+  },
+  {
+    id: "L11-T1", lessonId: "L11",
+    tool: "傾向・評価を表す形容詞構文(be apt to do / it is 形容詞 of A to do)",
+    rule: "be apt/liable to doは「〜しがちだ」という傾向、it is 形容詞 of A to doは人の性質を主観的に評価する構文。",
+    example: "Teenagers are apt to underestimate long-term risks. / It was reckless of the company to ignore the warning.",
+    usage: "自由英作文で人間や社会の傾向を一般化して述べる際に使う。単なる事実の記述より説得力のある評価表現になる。",
+    caution: "it is important that SV では should do または原形が使われる(仮定法現在)。",
+    commonMistake: "It is important that he does it のようにthat節を直説法のまま使ってしまう。",
+    relatedExpressions: ["seem to do", "easy/difficult to do(tough構文)", "it is 形容詞 for A to do"],
+  },
+  {
+    id: "L13-T1", lessonId: "L13",
+    tool: "最上級相当表現による強調(no other A is as ~ as / never before have S been)",
+    rule: "最上級は1文で言い切れるが、比較級・原級を使った最上級相当表現は「他のどれも及ばない」ことを強調でき、論証的な文体に向く。",
+    example: "No other invention has changed communication as drastically as the smartphone.",
+    usage: "自由英作文の主張を強めるレトリックとして、最上級だけでなくno other...as...as構文を使うと説得力が増す。",
+    caution: "than any other の後は単数名詞(比較対象から自分自身を除くため)。",
+    commonMistake: "than any other の後に複数形を置いてしまう誤り。",
+    relatedExpressions: ["the +最上級+of all", "as+原級+as possible", "such a+形容詞+名詞+as"],
+  },
+  {
+    id: "L14-T1", lessonId: "L14",
+    tool: "比例・倍数表現による量的変化の記述(the+比較級, the+比較級 / X times as ~ as)",
+    rule: "the 比較級, the 比較級は「〜すればするほど…」という相関関係、X times as ~ asは倍数表現。",
+    example: "The more automated a task becomes, the fewer people are needed to perform it.",
+    usage: "自由英作文で因果関係・相関関係を簡潔に表現する際に使う。データや傾向を語る段落と相性が良い。",
+    caution: "the 比較級, the 比較級の後半は倒置(be動詞の省略等)が起きやすいので語順に注意。",
+    commonMistake: "the more..., the more... の節の主語・動詞の順序を誤る。",
+    relatedExpressions: ["as+原級+as possible", "more and more A doing", "much/far+比較級"],
+  },
+];
+const GRAMMAR_MINI_LESSON_MAP = Object.fromEntries(GRAMMAR_MINI_LESSONS.map(m => [m.id, m]));
+
+// (B) Logic / Argumentation Mini Lessons — §11の2本目の柱。講に依存しない独立教材。
+// Claim/Reason/Explanation/Example/Counterargument/Rebuttal/Conclusionの核7本に加え、
+// ユーザー指定の7概念(Reason-vs-Explanation等)を過不足なく追加し、計14本とする。
+const LOGIC_MINI_LESSONS = [
+  {
+    id: "logic-01", title: "Claim(主張)",
+    concept: "エッセイ全体で一貫して支持する、一文で言い切れる立場表明。",
+    explanation: "Claimは問いに対する自分の答えであり、賛成/反対など明確な立場を取る必要がある。「どちらとも言える」という曖昧な立場は避ける。",
+    example: `"Should schools ban smartphones?" に対して → "Schools should restrict smartphone use during class hours."`,
+    usage: "序論の最後に1文で明確に置き、結論でも同じ立場を繰り返して一貫性を示す。",
+    caution: "設問の一部にしか答えていないClaimは、課題達成度の評価で減点対象になりやすい。",
+    commonMistake: `Claimを一般論("Technology has advantages and disadvantages.")のまま終わらせ、立場を明言しないミス。`,
+    relatedConcepts: ["logic-07", "logic-11"],
+  },
+  {
+    id: "logic-02", title: "Reason(理由)",
+    concept: "Claimを支える「なぜそう考えるか」の根拠。",
+    explanation: "1つのBody paragraphにつき原則1つのReasonを置く。ReasonはClaimより一段階具体的な主張になる。",
+    example: "Claim: 学校はスマホを制限すべき → Reason: スマホは生徒の集中力を妨げるから。",
+    usage: "Because / One reason is that などで導入し、その後Explanationで掘り下げる。",
+    caution: "ReasonだけでBodyを終えると根拠が浅くなる(logic-08参照)。",
+    commonMistake: "ReasonとClaimを同じ内容の言い換えで済ませてしまう(トートロジー)。",
+    relatedConcepts: ["logic-03", "logic-08"],
+  },
+  {
+    id: "logic-03", title: "Explanation(説明)",
+    concept: "Reasonがなぜ成り立つのかを、因果関係やメカニズムで掘り下げる部分。",
+    explanation: "「Reasonが真であるとなぜ言えるのか」を一般的な理屈で補強する。具体例(Example)とは異なり、まだ個別のエピソードではない。",
+    example: "Reason: スマホは集中力を妨げる → Explanation: 通知が頻繁に届くことで、生徒は数分おきに注意を切り替えることを強いられ、深い思考が持続しにくくなる。",
+    usage: "This is because / This means that などで接続し、Reasonの一般化された理由付けを行う。",
+    caution: "Explanationがないと、Reasonが単なる主張の繰り返しに見えてしまう。",
+    commonMistake: "Explanationを飛ばして、いきなりExampleに入ってしまう(論理が飛躍する)。",
+    relatedConcepts: ["logic-02", "logic-04", "logic-09"],
+  },
+  {
+    id: "logic-04", title: "Example(具体例)",
+    concept: "Explanationで述べた一般論を裏付ける、個別・具体的な事例やデータ。",
+    explanation: "Exampleは「実際に起きたこと・観察できること」であり、Explanationより抽象度が一段低い。",
+    example: "Explanation: 通知により注意が分散する → Example: ある調査では、授業中にスマホを机上に置いていた生徒は、置いていなかった生徒よりテストの平均点が低かった。",
+    usage: "For example / In fact / A study found that などで導入する。",
+    caution: "Exampleだけを並べてExplanationを省くと、なぜその例が根拠になるのかが読者に伝わらない。",
+    commonMistake: "ExampleをReasonの代わりに使ってしまい、一般化された主張がないまま個別の話で終わる。",
+    relatedConcepts: ["logic-03", "logic-09", "logic-13"],
+  },
+  {
+    id: "logic-05", title: "Counterargument(反対意見への言及)",
+    concept: "自分のClaimとは異なる立場や、想定される反論をあえて提示する部分。",
+    explanation: "反対意見を無視するより、公平に取り上げたうえで反論する方が、論証のバランス感覚が高いと評価されやすい。",
+    example: "Some may argue that smartphones can also be used for educational purposes during class.",
+    usage: "Admittedly / It is true that / Some may argue that などで導入し、直後にRebuttalへ接続する。",
+    caution: "Counterargumentに深入りしすぎると、自分のClaimの分量が減り論旨がぼやける。",
+    commonMistake: "Counterargumentを述べたまま反論せずに終えてしまい、自分の立場が揺らいで見える。",
+    relatedConcepts: ["logic-06", "logic-01"],
+  },
+  {
+    id: "logic-06", title: "Rebuttal(再反論)",
+    concept: "Counterargumentを認めつつ、それでも自分のClaimの方が妥当だと示す部分。",
+    explanation: "反対意見の一部を認める(部分的譲歩)ことで、単なる否定より説得力のある反論になる。",
+    example: "However, the benefits of controlled smartphone use do not outweigh the distraction it causes during class time.",
+    usage: "However / Nevertheless / Even so などで導入し、Counterargumentの弱点や適用範囲の限界を指摘する。",
+    caution: "Rebuttalが弱いと、Counterargumentの方が説得力があるように読めてしまう。",
+    commonMistake: "Rebuttalなしで単にCounterargumentを紹介するだけで終わる(結論が反対意見に流される)。",
+    relatedConcepts: ["logic-05", "logic-07"],
+  },
+  {
+    id: "logic-07", title: "Conclusion(結論)",
+    concept: "序論のClaimを異なる言葉で再確認し、エッセイ全体を締めくくる部分。",
+    explanation: "単なる繰り返しではなく、Body paragraphsで展開した論拠を踏まえたうえでの再主張にする。",
+    example: "For these reasons, schools should limit smartphone use during class hours to protect students' concentration.",
+    usage: "In conclusion / For these reasons などで導入し、新しい情報は追加しない。",
+    caution: "Conclusionで新しい主張やReasonを持ち出すと、構成が崩れて見える。",
+    commonMistake: "序論と全く同じ文をそのままコピーしてしまう(単調で稚拙な印象を与える)。",
+    relatedConcepts: ["logic-01"],
+  },
+  {
+    id: "logic-08", title: "ReasonとExplanationの違い",
+    concept: "Reasonは「なぜそう思うか」の一言、Explanationは「その理由がなぜ成り立つか」の掘り下げ。",
+    explanation: "多くの学習者はReasonを書いた後、すぐExampleに飛んでしまいExplanationが抜け落ちる。ReasonとExampleの間に、一般的なメカニズムの説明を1〜2文挟むことが必要。",
+    example: `Reason: 「運動は精神的健康に良い」→ Explanation: 「有酸素運動によってストレスホルモンの分泌が抑えられ、気分を安定させる神経伝達物質が増えるため」→ Example: 「実際、定期的に運動する人は…」`,
+    usage: "Body paragraphを書く際、Reasonの直後に「なぜそのReasonが成り立つのか」を自問し、1文加える。",
+    caution: "ExplanationがないままExampleに入ると、論理の飛躍が生じる。",
+    commonMistake: "ReasonをExplanationのつもりで言い換えているだけで、実質的に新しい情報を追加できていない。",
+    relatedConcepts: ["logic-02", "logic-03", "logic-10"],
+  },
+  {
+    id: "logic-09", title: "ExplanationとExampleの違い",
+    concept: "Explanationは一般化された理屈、Exampleは個別の事実・データ・エピソード。",
+    explanation: "Explanationは「常にそうである理由」を述べ、Exampleは「実際にそうであった一つのケース」を示す。抽象度の高さが異なる。",
+    example: `Explanation: 「SNSの利用は睡眠の質を下げる傾向がある」(一般論) / Example: 「ある大学の調査では、就寝前にSNSを30分以上使用した学生の68%が睡眠の質の低下を報告した」(個別データ)`,
+    usage: "Explanationで一般論を述べたあと、For example / A recent study found などで個別の裏付けに接続する。",
+    caution: "ExampleをExplanationの代わりに単独で使うと、一般化が不十分なまま終わる。",
+    commonMistake: "抽象度を上げ下げする合図の語(for example等)を使わずに、唐突に具体例へ切り替えてしまう。",
+    relatedConcepts: ["logic-03", "logic-04", "logic-13"],
+  },
+  {
+    id: "logic-10", title: "Why?/So what?による理由の深掘り",
+    concept: "自分の書いたReason・Explanationに対して「なぜ?」「だから何?」を繰り返し自問し、論証を一段深くする技術。",
+    explanation: "浅い理由付けで終わらせず、Why?を2回程度繰り返すことで、より本質的な根拠に到達できる。So what?は、その根拠がClaimにとってなぜ重要かを確認する問い。",
+    example: `Reason: 「制服は生徒の格差を目立たなくする」→ Why?「経済的背景による服装の違いが可視化されないから」→ So what?「その結果、生徒間の疎外感や比較意識が減り、学習環境の平等性が高まる」`,
+    usage: "Body paragraphを書き終えたあと、見直しの段階でWhy?/So what?を自分に問いかけ、論拠が浅くないか確認する。",
+    caution: "深掘りしすぎるとBody 1つに複数の論点が混在し、Body間の重複防止に反する場合がある。",
+    commonMistake: "Why?を1回しか問わず、表面的な理由で満足してしまう。",
+    relatedConcepts: ["logic-08", "logic-12"],
+  },
+  {
+    id: "logic-11", title: "題意逸脱の防止",
+    concept: "設問(POINTSや条件)から外れず、一貫して問いに答え続けること。",
+    explanation: "自由英作文の採点では課題達成度がゲート項目になっており、内容が優れていても設問と無関係な方向に進むと大きく減点される。",
+    example: "設問が「AIの活用に政府の規制は必要か」であるのに、AIの技術的な仕組みの説明に終始してしまうと題意から逸脱している。",
+    usage: "各段落を書く前に「この段落はClaimを直接支持しているか」を確認する。設問のキーワードを段落内に意識的に含める。",
+    caution: "Counterargument/Rebuttalの段落でも、設問のテーマから外れないよう注意する。",
+    commonMistake: "話題は近いが設問の問い自体には答えていない一般論を書いてしまう。",
+    relatedConcepts: ["logic-01", "logic-12"],
+  },
+  {
+    id: "logic-12", title: "Body間の論点重複の防止",
+    concept: "複数のBody paragraphそれぞれに、異なる観点のReasonを割り当てること。",
+    explanation: "同じ理由を言い換えただけの段落を2つ書いても、論証の厚みは増えない。学習・経済・倫理のように異なる角度からReasonを立てる。",
+    example: "Body 1: 学習効果の観点 / Body 2: 経済的コストの観点、のように軸を変える。同じ「集中力」の話を2つのBodyで繰り返さない。",
+    usage: "アウトラインの段階で各BodyのReasonを一言で書き出し、意味が重なっていないか確認する。",
+    caution: "観点を分けたつもりでも、Explanationの内容が実質的に同じになっていないか注意する。",
+    commonMistake: "Body 2がBody 1の言い換えになってしまい、実質的に1つの論点しか展開できていない。",
+    relatedConcepts: ["logic-02", "logic-11"],
+  },
+  {
+    id: "logic-13", title: "抽象→具体の書き方",
+    concept: "一般的な主張(抽象)から、個別の事例・データ(具体)へと段階的に降りていく文章構成。",
+    explanation: "Claim→Reason→Explanation→Exampleの流れ自体が抽象から具体への移動になっている。急に抽象度を変えず、間の階段を飛ばさないことが読みやすさの鍵。",
+    example: `抽象: 「教育格差は社会全体の損失である」→ やや具体: 「特に情報格差は将来の職業選択に直結する」→ 具体: 「地方の高校ではプログラミング教育を受けられる生徒が都市部の3分の1に留まるという調査がある」`,
+    usage: "1つのBody paragraph内で、抽象度の異なる文をいきなり並べず、Reason→Explanation→Exampleの順で徐々に具体化する。",
+    caution: "逆に具体例だけを並べて一般化(抽象化)を行わないと、単なるエピソード紹介で終わる。",
+    commonMistake: "抽象的な文と具体的な文の間に橋渡しとなる中間の文がなく、論理が飛躍する。",
+    relatedConcepts: ["logic-09", "logic-08"],
+  },
+  {
+    id: "logic-14", title: "Claim→Reason→Explanation→ExampleをひとつのBody paragraphに統合する方法",
+    concept: "これまでの要素(Reason/Explanation/Example)を1つの段落として自然につなげる技術。",
+    explanation: "Body paragraphは、①トピックセンテンス(そのBodyのReason)→②Explanation(なぜそのReasonが成り立つか)→③Example(具体的な裏付け)→④その段落をClaimに結びつける一文、という4段構成にすると一貫性が保たれる。",
+    example: `① Reason: Group projects help students develop communication skills. ② Explanation: Working with peers requires students to negotiate ideas and resolve disagreements, skills that are rarely practiced in individual assignments. ③ Example: In a survey of high school students, those who regularly participated in group projects reported significantly higher confidence in teamwork settings. ④ Link: This ability to collaborate effectively is increasingly valued in modern workplaces, directly supporting the claim that schools should incorporate more group-based learning.`,
+    usage: "Body paragraphの下書き段階で、この4文構成をテンプレートとして意識すると、要素の抜け漏れを防げる。",
+    caution: "4要素をすべて機械的に同じ長さで書く必要はない。Explanationがやや長くなることが多い。",
+    commonMistake: "Exampleで終わってしまい、④のClaimへの結びつけの一文がないため、段落が「浮いて」見える。",
+    relatedConcepts: ["logic-02", "logic-03", "logic-04"],
+  },
+];
+const LOGIC_MINI_LESSON_MAP = Object.fromEntries(LOGIC_MINI_LESSONS.map(m => [m.id, m]));
+
+// (C) Vocabulary / Collocation — §11の1本目の柱の一部。各chunkを独立entryとして構造化する
+// (Expression Engine=Phase 9で再利用可能な最小単位)。カテゴリは英作文での機能・用途基準の9種に限定。
+const VOCAB_ENTRIES = [
+  // cause-effect
+  { id: "voc-001", expression: "contribute to", meaning: "〜の一因となる、〜に貢献する", usage: "原因・結果の関係を述べる際、名詞を続けて使う(contribute to Ving/名詞)。", example: "Excessive smartphone use may contribute to a decline in students' concentration.", caution: "contribute toの後は名詞または動名詞。to不定詞にしない。", category: "cause-effect" },
+  { id: "voc-002", expression: "lead to", meaning: "〜につながる、〜を引き起こす", usage: "ある行動や現象が別の結果を引き起こす因果関係を簡潔に示す。", example: "Prolonged exposure to social media can lead to feelings of isolation.", caution: "leadは自動詞的にto+名詞を続ける形。lead toの後にSVは置けない。", category: "cause-effect" },
+  { id: "voc-003", expression: "result in", meaning: "〜という結果になる", usage: "原因→結果の順で、原因を主語にして結果を述べる際に使う。", example: "The new policy resulted in a significant increase in recycling rates.", caution: "result inとresult fromは方向が逆(A results in B / B results from A)。", category: "cause-effect" },
+  { id: "voc-004", expression: "stem from", meaning: "〜に起因する、〜から生じる", usage: "問題や感情の根本的な原因を指摘する際に使う、ややフォーマルな表現。", example: "Much of the conflict stems from a lack of communication between the two parties.", caution: "受動態にしない(stem fromはそれ自体が能動的な「起因する」の意味)。", category: "cause-effect" },
+  // importance
+  { id: "voc-005", expression: "play a crucial role in", meaning: "〜において重要な役割を果たす", usage: "ある要素が結果に対して持つ重要性を強調する際の定番表現。", example: "Early childhood education plays a crucial role in shaping long-term academic success.", caution: "crucialの代わりにvital/significant/keyなども言い換えとして使える。", category: "importance" },
+  { id: "voc-006", expression: "be essential to", meaning: "〜に不可欠である", usage: "ある要素が目的達成のために必須であることを述べる。", example: "Access to clean water is essential to public health.", caution: "essential to A(名詞)とessential for A to do の形の違いに注意。", category: "importance" },
+  { id: "voc-007", expression: "cannot be overstated", meaning: "〜は誇張しすぎることはない、極めて重要だ", usage: "重要性を強く印象づけたい結論部などで使う強調表現。", example: "The importance of mental health support for students cannot be overstated.", caution: "The importance of A cannot be overstated. の形で使うことが多い。", category: "importance" },
+  { id: "voc-008", expression: "of great significance", meaning: "非常に重要な", usage: "be of great significance to Aの形で「Aにとって重要である」を表す、ややフォーマルな言い方。", example: "This discovery is of great significance to future medical research.", caution: "importantの単純な繰り返しを避けたいときの言い換えとして使う。", category: "importance" },
+  // advantage-disadvantage
+  { id: "voc-009", expression: "have a positive impact on", meaning: "〜に良い影響を与える", usage: "利点を述べる際の基本表現。negativeに置き換えれば欠点にも使える。", example: "Regular exercise has a positive impact on both physical and mental health.", caution: "impactは可算・不可算どちらでも使われるが、a positive impactのように冠詞を忘れない。", category: "advantage-disadvantage" },
+  { id: "voc-010", expression: "outweigh the drawbacks", meaning: "欠点を上回る", usage: "利点と欠点を比較したうえで、総合的な結論を述べる際に使う。", example: "In this case, the benefits of remote work outweigh the drawbacks.", caution: "The benefits outweigh the drawbacks. のように主語をbenefits側にするのが自然。", category: "advantage-disadvantage" },
+  { id: "voc-011", expression: "come at a cost", meaning: "代償を伴う", usage: "利点にも何らかの犠牲が伴うことを示す際に使う。", example: "Rapid economic growth often comes at a cost to the environment.", caution: "come at a cost to A の形でAに「何への代償か」を続けられる。", category: "advantage-disadvantage" },
+  { id: "voc-012", expression: "at the expense of", meaning: "〜を犠牲にして", usage: "何かを得る代わりに別の何かを失うトレードオフを表す。", example: "The company increased profits at the expense of employee well-being.", caution: "経済的な意味の「費用」だけでなく、比喩的な「犠牲」にも使える。", category: "advantage-disadvantage" },
+  // problem-solution
+  { id: "voc-013", expression: "address the problem", meaning: "問題に取り組む、対処する", usage: "問題解決のための行動を述べる際の基本表現。", example: "Governments must address the problem of plastic pollution more aggressively.", caution: "address to the problem のようにtoを入れない(addressは他動詞)。", category: "problem-solution" },
+  { id: "voc-014", expression: "tackle the issue", meaning: "課題に取り組む", usage: "addressよりやや口語的だが、フォーマルな文章でも広く使われる。", example: "Schools are beginning to tackle the issue of cyberbullying through education.", caution: "issueとproblemはほぼ同義だが、issueの方が中立的なニュアンスを持つ。", category: "problem-solution" },
+  { id: "voc-015", expression: "pose a threat to", meaning: "〜に脅威を与える", usage: "問題を提起する際、主語を「問題そのもの」にして使う。", example: "Climate change poses a serious threat to global food security.", caution: "pose a threat to A の後は名詞。動詞は続けない。", category: "problem-solution" },
+  { id: "voc-016", expression: "take measures to", meaning: "〜するための対策を講じる", usage: "解決策(Solution)を提示する段落で使う定番表現。", example: "The city has taken measures to reduce traffic congestion in the downtown area.", caution: "take measures to do(不定詞)の形。take measures for doingではない。", category: "problem-solution" },
+  // comparison
+  { id: "voc-017", expression: "in contrast to", meaning: "〜とは対照的に", usage: "2つの事柄を対比させて論じる際、文頭で使うことが多い。", example: "In contrast to urban areas, rural communities often lack access to specialized medical care.", caution: "In contrast, (単独)とIn contrast to A(名詞を伴う)の使い分けに注意。", category: "comparison" },
+  { id: "voc-018", expression: "unlike", meaning: "〜と異なり", usage: "前置詞として、対比する対象を直接後ろに置く。", example: "Unlike traditional classrooms, online learning allows students to study at their own pace.", caution: "unlikeの後はSVではなく名詞(句)。", category: "comparison" },
+  { id: "voc-019", expression: "to a greater extent", meaning: "より大きな程度で", usage: "比較の度合いを表す際、比較級と組み合わせて使うことが多い。", example: "Younger generations rely on digital communication to a much greater extent than their parents did.", caution: "to a lesser extentで反対の意味にもできる。", category: "comparison" },
+  { id: "voc-020", expression: "on the other hand", meaning: "他方で", usage: "対比の後半を導入する接続表現。in contrastよりやや柔らかい印象。", example: "On the other hand, some argue that stricter regulations could stifle innovation.", caution: "文頭でカンマを伴って使うのが一般的。", category: "comparison" },
+  // opinion
+  { id: "voc-021", expression: "I am convinced that", meaning: "私は〜だと確信している", usage: "序論や結論でClaimを述べる際の意見表明表現。I thinkより強い確信度を示す。", example: "I am convinced that early exposure to multiple languages benefits cognitive development.", caution: "I believeよりフォーマルで強い主張になるため、根拠が伴う文脈で使う。", category: "opinion" },
+  { id: "voc-022", expression: "it is widely believed that", meaning: "〜だと広く信じられている", usage: "一般的な見解を紹介し、自分の意見と対比させる際に使う。", example: "It is widely believed that technology has made people less socially connected.", caution: "自分の意見ではなく一般論の紹介であることに注意(Counterargumentの導入にも使える)。", category: "opinion" },
+  { id: "voc-023", expression: "from my point of view", meaning: "私の見解では", usage: "個人的な立場を明示する際の表現。in my opinionの言い換え。", example: "From my point of view, the benefits of urban green spaces far outweigh the costs of their maintenance.", caution: "多用すると単調になるため、他の意見表明表現と交互に使う。", category: "opinion" },
+  { id: "voc-024", expression: "there is no denying that", meaning: "〜は否定できない", usage: "強い確信を持って主張を導入する、あるいは反対意見の一部を認める際にも使える。", example: "There is no denying that artificial intelligence will reshape the job market.", caution: "その後に続く内容は一般的に広く合意されている事実に近いものにする。", category: "opinion" },
+  // society
+  { id: "voc-025", expression: "have access to", meaning: "〜を利用できる、〜へのアクセスがある", usage: "教育・医療・情報などへの格差やアクセス可能性を論じる際の頻出表現。", example: "Not everyone has access to high-quality healthcare in rural areas.", caution: "accessは不可算名詞。an accessのように冠詞をつけない。", category: "society" },
+  { id: "voc-026", expression: "place a burden on", meaning: "〜に負担をかける", usage: "社会的・経済的コストが特定の集団にかかることを述べる際に使う。", example: "The aging population is placing a growing burden on the healthcare system.", caution: "burdenの後はon A(誰に負担がかかるか)を続ける。", category: "society" },
+  { id: "voc-027", expression: "widen the gap between", meaning: "〜の間の格差を広げる", usage: "格差・不平等の拡大を論じる際の表現。", example: "Unequal access to technology may widen the gap between urban and rural students.", caution: "narrow the gap between で「格差を縮める」の反対表現になる。", category: "society" },
+  { id: "voc-028", expression: "raise public awareness of", meaning: "〜についての社会的関心を高める", usage: "解決策の一環として、教育・啓発活動の重要性を述べる際に使う。", example: "Campaigns to raise public awareness of mental health issues have expanded in recent years.", caution: "raise awareness among A(誰の間で)もあわせて使えると表現の幅が出る。", category: "society" },
+  // education
+  { id: "voc-029", expression: "foster critical thinking", meaning: "批判的思考力を育む", usage: "教育の目的・効果を述べる際の頻出表現。", example: "Discussion-based learning helps foster critical thinking among students.", caution: "fosterはencourage/develop/cultivateなどに言い換えられる。", category: "education" },
+  { id: "voc-030", expression: "equip students with", meaning: "生徒に〜を身につけさせる", usage: "教育が与える能力・スキルを述べる際に使う。", example: "Schools should equip students with the skills needed to navigate a rapidly changing job market.", caution: "equip A with B の形(Aに何を身につけさせるか)。", category: "education" },
+  { id: "voc-031", expression: "lay the foundation for", meaning: "〜の基礎を築く", usage: "初期教育や基礎学習が将来につながることを述べる際の比喩的表現。", example: "Early literacy programs lay the foundation for lifelong learning.", caution: "buildやestablishでも近い意味だが、foundationとの組み合わせが最も自然。", category: "education" },
+  { id: "voc-032", expression: "broaden one's horizons", meaning: "視野を広げる", usage: "留学や多様な経験の教育的効果を述べる際に使う定番表現。", example: "Studying abroad can broaden students' horizons and foster cultural understanding.", caution: "one'sの部分は主語に合わせて変える(broaden their horizons等)。", category: "education" },
+  // environment
+  { id: "voc-033", expression: "have a detrimental effect on", meaning: "〜に有害な影響を与える", usage: "環境破壊の悪影響を述べる際のフォーマルな表現。harmful/negativeよりやや強い響き。", example: "Overfishing has a detrimental effect on marine ecosystems.", caution: "detrimentalはeffect/impactと組み合わせて使うことが多い。", category: "environment" },
+  { id: "voc-034", expression: "deplete natural resources", meaning: "天然資源を枯渇させる", usage: "資源の過剰消費を論じる際の表現。", example: "Rapid industrialization has significantly depleted the region's natural resources.", caution: "depleteは他動詞。resources are depleted のように受動態でも使われる。", category: "environment" },
+  { id: "voc-035", expression: "mitigate the impact of", meaning: "〜の影響を緩和する", usage: "対策・解決策を述べる際に使う、ややフォーマルな表現。", example: "Renewable energy can help mitigate the impact of climate change.", caution: "reduce/lessenよりフォーマルな響きを持つ。", category: "environment" },
+  { id: "voc-036", expression: "promote sustainable development", meaning: "持続可能な発展を促進する", usage: "環境と経済の両立を論じる際の締めくくりとして使いやすい表現。", example: "International cooperation is essential to promote sustainable development worldwide.", caution: "sustainableは「持続可能な」という意味で環境・経済両方の文脈に使える。", category: "environment" },
+];
+const VOCAB_CATEGORIES = ["cause-effect", "importance", "advantage-disadvantage", "problem-solution", "comparison", "opinion", "society", "education", "environment"];
+const VOCAB_MAP = Object.fromEntries(VOCAB_ENTRIES.map(v => [v.id, v]));
+
 function extractJsonSubstring(text) {
   const firstObj = text.indexOf("{");
   const firstArr = text.indexOf("[");
