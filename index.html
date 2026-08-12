@@ -658,6 +658,7 @@ ${ACTIVE_ERROR_TYPES.map(k => `${k}: ${ERROR_TYPE_TAXONOMY[k].label}`).join(" / 
 // review(Phase 8)は不正解時のみOccurrenceを追加する対象として、ここに追加する。
 const OCCURRENCE_SEVERITY = {
   finalCheckRemedial: 4, finalCheck: 3, freeWriting: 3, weeklyRemedial: 3, weekly: 2, support: 1, review: 2,
+  skillTraining: 1,
 };
 const WEAKNESS_REGISTERED_SOURCE_TYPES = Object.keys(OCCURRENCE_SEVERITY);
 const WEAKNESS_MAX_COUNT = 200;
@@ -1198,6 +1199,127 @@ function removeModelEssayReferenceFromExpressions(expressions, modelEssayId) {
     }
   });
   return next;
+}
+
+// ---------- Phase 11: SKILL TRAINING (MASTER_SPEC PART 13) ----------
+// Expression Arsenal(Phase 9)のLEARNED→PRACTICED、およびModel Essay(Phase 10)承認済みTakeaway
+// (Structures/Logic)を使ったControlled Practiceを実装する。Grammarは既存のToday's Five等と
+// 重複するため対象外。Organizationも今回は対象外。PRODUCED/MASTEREDへの昇格は一切行わない
+// (PRODUCEDは自由英作文での自発使用検出のみが付与する、Phase 9の原則を維持)。
+
+const SKILL_TRAINING_EXPRESSION_COUNT = 5;
+const SKILL_TRAINING_EXPANSION_COUNT = 3;
+const EXPRESSION_MASTERY_ORDER = { UNSEEN: 0, LEARNED: 1, PRACTICED: 2, PRODUCED: 3 };
+
+// 出題対象の選定: MASTEREDを除外し、UNSEEN→LEARNED→PRACTICED→PRODUCEDの順で優先、
+// 同一状態内はpracticedCountが少ない順。プールが count に満たない場合はラウンドロビンで埋める。
+function pickSkillTrainingExpressions(expressions, count) {
+  const eligible = Object.values(expressions).filter(e => e.masteryState !== "MASTERED");
+  const sorted = eligible.sort((a, b) => {
+    const oa = EXPRESSION_MASTERY_ORDER[a.masteryState] ?? 4;
+    const ob = EXPRESSION_MASTERY_ORDER[b.masteryState] ?? 4;
+    if (oa !== ob) return oa - ob;
+    return (a.practicedCount || 0) - (b.practicedCount || 0);
+  });
+  const picked = [];
+  for (let i = 0; i < count && sorted.length > 0; i++) picked.push(sorted[i % sorted.length]);
+  return picked;
+}
+
+// UNSEEN→LEARNEDの遷移。「練習へ進む」という明示操作が行われた時点でのみ呼び出すこと
+// (INPUTカードの表示自体では呼び出さない。セッションを閉じた場合はUNSEENのまま)。
+function markExpressionsLearned(expressions, expressionIds) {
+  let next = expressions;
+  (expressionIds || []).forEach(id => {
+    const ex = next[id];
+    if (ex && ex.masteryState === "UNSEEN") {
+      next = { ...next, [id]: { ...ex, masteryState: "LEARNED", lastSeenAt: new Date().toISOString() } };
+    }
+  });
+  return next;
+}
+
+// Skill Training(Expression)の採点結果をExpressionへ反映する。
+// - assessment !== "avoided" かつ 現在UNSEEN/LEARNEDの場合のみPRACTICEDへ進める
+// - 既にPRODUCED/MASTEREDのExpressionは状態を変更しない(降格させない、Skill Trainingでは昇格もさせない)
+// - practicedCountは採点された試行である限り、正誤・assessmentに関わらず必ず+1する
+function applySkillPracticeResult(expression, assessment) {
+  let masteryState = expression.masteryState;
+  if ((masteryState === "UNSEEN" || masteryState === "LEARNED") && assessment !== "avoided") {
+    masteryState = "PRACTICED";
+  }
+  return { ...expression, masteryState, practicedCount: (expression.practicedCount || 0) + 1, lastSeenAt: new Date().toISOString() };
+}
+
+async function generateSkillPracticeProblems(elements) {
+  const sys = `あなたは英作文の練習問題作成者です。
+以下の各行は「表現ID: 表現(意味・使いどころ)」の形式です。各行につき1問、その表現を使わないと自然に訳しにくい和文英訳問題を作成してください。
+以下のJSON配列のみを出力してください。説明やコードフェンスは付けないでください。配列の要素数は入力行数と必ず一致させてください。
+[{"elementId": "行頭のID", "japanese": "和文問題文", "modelAnswer": "模範解答の英文(対象表現を使うこと)"}]`;
+  const list = elements.map(e => `${e.id}: ${e.label}(${e.desc})`).join("\n");
+  const clean = await withRetry(() => callClaudeRaw(sys, list, 1400));
+  return JSON.parse(clean);
+}
+
+async function gradeSkillPracticeAnswers(items, classificationList) {
+  const list = classificationList || [];
+  const sys = `あなたは英作文の採点者です。日本人学習者の解答を採点してください。
+各設問には対象表現(targetElementId)が設定されています。解答がその対象表現を実際に使っているかを判定してください。
+- "used": 対象表現をそのまま使っている
+- "equivalent": 対象表現とは異なるが、文法的に正しく自然な同義表現になっている(回避とはみなさない)
+- "avoided": 対象表現を使わずに済む書き方で回避している、または誤って使えていない
+選べる対象ID一覧:
+${list.map(e => `${e.id}: ${e.label}`).join("\n")}
+
+${ERROR_TYPE_PROMPT_BLOCK}
+
+以下のJSON配列のみを出力してください。入力と同じ順番・同じ件数で返してください。説明やコードフェンスは付けないでください。
+[{"correct": true/false, "correctedText": "自然な模範解答", "feedback": "日本語で短いコメント", "targetSkillAssessment": "used"|"equivalent"|"avoided", "errorType": "分類のキーまたはnull", "errorPattern": "機械可読なキーまたはnull"}]`;
+  const payload = items.map((it, i) => ({ no: i + 1, targetElementId: it.elementId, japanese: it.japanese, modelAnswer: it.modelAnswer, userAnswer: it.userAnswer }));
+  const clean = await withRetry(() => callClaudeRaw(sys, JSON.stringify(payload), 1600));
+  return JSON.parse(clean);
+}
+
+// 承認済みTakeaway(Structures/Logic)からの出題対象選定。drill-logの記録から「未使用のtakeawayId」を
+// 優先する(スペース反復のような専用スケジューリングは導入しない、単純な未使用優先のみ)。
+async function pickSkillTrainingTakeaways(modelEssays, categories, count) {
+  const all = [];
+  Object.values(modelEssays).forEach(me => {
+    categories.forEach(cat => {
+      (me.approvedTakeaways && me.approvedTakeaways[cat] ? me.approvedTakeaways[cat] : []).forEach(t => {
+        all.push({ ...t, category: cat, modelEssayId: me.id });
+      });
+    });
+  });
+  let usedIds = new Set();
+  try {
+    const r = await window.storage.get("drill-log", false);
+    if (r) {
+      const log = JSON.parse(r.value);
+      log.forEach(entry => { if (entry.sourceType === "skillTrainingExpansion" && entry.elementId) usedIds.add(entry.elementId); });
+    }
+  } catch (e) { /* best effort */ }
+  const sorted = all.sort((a, b) => (usedIds.has(a.takeawayId) ? 1 : 0) - (usedIds.has(b.takeawayId) ? 1 : 0));
+  return sorted.slice(0, count);
+}
+
+async function generateExpansionPracticeProblems(takeawayItems) {
+  const sys = `あなたは英作文の構成練習問題の作成者です。
+以下の各行は「ID: 技法の説明」です。各行につき1つ、短い主張(claim、日本語1文)を作成し、その技法を使って複数文に展開させる指示を書いてください。
+以下のJSON配列のみを出力してください。説明やコードフェンスは付けないでください。配列の要素数は入力行数と必ず一致させてください。
+[{"elementId": "行頭のID", "claim": "日本語の短い主張1文", "instruction": "日本語での指示文(この技法を使って英語で展開するよう指示する)"}]`;
+  const list = takeawayItems.map(t => `${t.takeawayId}: ${t.pattern || t.technique} — ${t.explanation}`).join("\n");
+  const clean = await withRetry(() => callClaudeRaw(sys, list, 1400));
+  return JSON.parse(clean);
+}
+
+async function gradeExpansionPractice(items) {
+  const sys = `あなたは英作文の採点者です。学習者が指定された技法を使って主張を複数文に展開できているか判定してください。
+以下のJSON配列のみを出力してください。入力と同じ順番・同じ件数で返してください。説明やコードフェンスは付けないでください。
+[{"usedTechnique": true/false, "feedback": "日本語で短いコメント", "correctedText": "改善例の英文"}]`;
+  const payload = items.map((it, i) => ({ no: i + 1, claim: it.claim, instruction: it.instruction, userAnswer: it.userAnswer }));
+  const clean = await withRetry(() => callClaudeRaw(sys, JSON.stringify(payload), 1400));
+  return JSON.parse(clean);
 }
 
 // ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
@@ -1830,6 +1952,7 @@ const ROUND_LABEL = {
   remedial: "定着問題(前回の間違い対策)",
   weekly: "週次演習(10問)", weeklyRemedial: "定着問題(週次演習の間違い対策)",
   review: "今日の復習",
+  skillTrainingExpression: "表現練習",
 };
 
 function DrillSession({ session, onAnswerChange, onSubmit, onFinish, onSupport, resultNote, onSecondaryAction, secondaryActionLabel, loading }) {
@@ -1963,6 +2086,71 @@ function FinalCheckSession({ session, onAnswerChange, onSubmit, onFinish, onReme
   );
 }
 
+// ---------- Phase 11: Skill Training(Expression)のINPUTカード段階の表示コンポーネント ----------
+function SkillTrainingCards({ session, onProceed, onCancel, loading }) {
+  return (
+    <div>
+      <div style={{ ...cardStyle, marginBottom: 12 }}>
+        <div style={labelStyle}>表現練習 — INPUT</div>
+        <div style={{ fontSize: 12, color: "#8A8478" }}>この{session.expressions.length}つの表現を確認してから練習に進みます。</div>
+      </div>
+      {session.expressions.map((ex, i) => (
+        <div key={i} style={{ ...cardStyle, marginBottom: 12 }}>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 15, color: "#2A2620" }}>{ex.text}</div>
+          <div style={{ fontSize: 13.5, color: "#3A3529", marginTop: 6 }}>{ex.meaning}</div>
+          {ex.usage && <div style={{ fontSize: 12.5, color: "#5A5347", marginTop: 4 }}>使いどころ: {ex.usage}</div>}
+          {ex.example && <div style={{ fontSize: 12.5, color: "#2F5D50", marginTop: 4, fontStyle: "italic" }}>{ex.example}</div>}
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 10 }}>
+        <button onClick={onCancel} style={ghostBtnWide}>閉じる</button>
+        <button onClick={onProceed} disabled={loading} style={primaryBtn(loading)}>{loading ? "準備中..." : "練習へ進む"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Phase 11: Logic/Structure(EXPANSION形式)の表示コンポーネント ----------
+function ExpansionSession({ session, onAnswerChange, onSubmit, onFinish, loading }) {
+  const allAnswered = session.problems.every(p => (p.userAnswer || "").trim().length > 0);
+  return (
+    <div>
+      <div style={{ ...cardStyle, marginBottom: 12 }}>
+        <div style={labelStyle}>構成・論理の技法練習({session.problems.length}問)</div>
+      </div>
+      {session.problems.map((p, i) => (
+        <div key={i} style={{ ...cardStyle, marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: "#8A8478", marginBottom: 6, fontFamily: "'IBM Plex Mono', monospace" }}>Q{i + 1}</div>
+          <div style={{ fontFamily: "'Newsreader', serif", fontSize: 16, color: "#2A2620", marginBottom: 6 }}>{p.claim}</div>
+          <div style={{ fontSize: 12.5, color: "#5A5347", marginBottom: 10 }}>{p.instruction}</div>
+          {session.stage === "answering" ? (
+            <textarea
+              value={p.userAnswer || ""}
+              onChange={(e) => onAnswerChange(i, e.target.value)}
+              placeholder="英語で展開して入力"
+              style={{ width: "100%", minHeight: 80, fontFamily: "'Newsreader', serif", fontSize: 15.5, border: "1px solid #E7E0CE", borderRadius: 6, padding: 8, boxSizing: "border-box" }}
+            />
+          ) : (
+            <div>
+              <div style={{ fontSize: 14, color: p.usedTechnique ? "#2F5D50" : "#B23A2E", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 4 }}>
+                {p.usedTechnique ? "◯ 技法を使えています" : "△ 技法が使えていません"}
+              </div>
+              <div style={{ fontSize: 14, color: "#3A3529", marginBottom: 4 }}><b>あなたの解答:</b> {p.userAnswer}</div>
+              <div style={{ fontSize: 14, color: "#2F5D50", marginBottom: 4 }}><b>改善例:</b> {p.correctedText}</div>
+              <div style={{ fontSize: 12.5, color: "#5A5347", fontStyle: "italic" }}>{p.feedback}</div>
+            </div>
+          )}
+        </div>
+      ))}
+      {session.stage === "answering" ? (
+        <button onClick={onSubmit} disabled={loading || !allAnswered} style={primaryBtn(loading || !allAnswered)}>{loading ? "採点中..." : "採点する"}</button>
+      ) : (
+        <button onClick={onFinish} style={primaryBtn(false)}>完了</button>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [view, setView] = useState("write"); // write | drill | freewrite | history | settings
   const [proxyUrlPresent, setProxyUrlPresent] = useState(!!getProxyUrl());
@@ -2004,6 +2192,10 @@ function App() {
   const [analysisPreview, setAnalysisPreview] = useState(null);
   const [meLoading, setMeLoading] = useState(false);
   const [meError, setMeError] = useState("");
+
+  // Phase 11: Skill Training専用のstate(既存session/finalCheckSession/reviewSessionとは独立)
+  const [skillSession, setSkillSession] = useState(null);      // Expression練習(cards→answering→result)
+  const [expansionSession, setExpansionSession] = useState(null); // Logic/Structure練習(answering→result)
 
   // freewrite state
   const [freeWriteState, setFreeWriteState] = useState({ lastTs: null, usedThemes: [] });
@@ -2584,19 +2776,30 @@ function App() {
         refreshExpressionStats();
       }
       const strip = ({ checked, ...rest }) => rest;
-      const approvedStructures = analysisPreview.structures.filter(x => x.checked).map(strip);
-      const approvedLogic = analysisPreview.logic.filter(x => x.checked).map(strip);
-      const approvedOrganization = analysisPreview.organization.filter(x => x.checked).map(strip);
-
+      // Phase 11: 承認済みStructures/Logic/Organizationに安定したtakeawayIdを付与する。
+      // 既存(累積済み)の件数を起点にした連番のため、再解析・再承認で既存項目のidが変わることはない。
       const me = modelEssays[selectedModelEssayId];
+      const existingStructures = (me.approvedTakeaways && me.approvedTakeaways.structures) || [];
+      const existingLogic = (me.approvedTakeaways && me.approvedTakeaways.logic) || [];
+      const existingOrganization = (me.approvedTakeaways && me.approvedTakeaways.organization) || [];
+      const approvedStructures = analysisPreview.structures.filter(x => x.checked).map(strip).map((item, i) => ({
+        takeawayId: `mt-${selectedModelEssayId}-structure-${existingStructures.length + i}`, ...item,
+      }));
+      const approvedLogic = analysisPreview.logic.filter(x => x.checked).map(strip).map((item, i) => ({
+        takeawayId: `mt-${selectedModelEssayId}-logic-${existingLogic.length + i}`, ...item,
+      }));
+      const approvedOrganization = analysisPreview.organization.filter(x => x.checked).map(strip).map((item, i) => ({
+        takeawayId: `mt-${selectedModelEssayId}-organization-${existingOrganization.length + i}`, ...item,
+      }));
+
       const updated = {
         ...me,
         approvalStatus: "APPROVED",
         approvedExpressionIds: [...new Set([...(me.approvedExpressionIds || []), ...expressionIds])],
         approvedTakeaways: {
-          structures: [...(me.approvedTakeaways?.structures || []), ...approvedStructures],
-          logic: [...(me.approvedTakeaways?.logic || []), ...approvedLogic],
-          organization: [...(me.approvedTakeaways?.organization || []), ...approvedOrganization],
+          structures: [...existingStructures, ...approvedStructures],
+          logic: [...existingLogic, ...approvedLogic],
+          organization: [...existingOrganization, ...approvedOrganization],
         },
         updatedAt: new Date().toISOString(),
       };
@@ -2608,6 +2811,173 @@ function App() {
       setMeError("承認処理に失敗しました。もう一度お試しください。");
     }
     setMeLoading(false);
+  }
+
+  // ---------- Phase 11: SKILL TRAINING ----------
+  // Expression練習: INPUTカード提示 → (明示操作で)UNSEEN→LEARNED → 練習問題生成 → 採点 → PRACTICED判定
+  async function startExpressionSkillTraining() {
+    setDrillError("");
+    setDrillLoading(true);
+    try {
+      const expressions = await loadExpressions();
+      const picked = pickSkillTrainingExpressions(expressions, SKILL_TRAINING_EXPRESSION_COUNT);
+      if (picked.length === 0) { setDrillLoading(false); return; }
+      setSkillSession({ round: "skillTrainingExpression", stage: "cards", expressions: picked });
+    } catch (e) {
+      setDrillError("表現練習の準備に失敗しました。");
+    }
+    setDrillLoading(false);
+  }
+
+  // 「練習へ進む」ボタンからのみ呼ばれる。ここで初めてUNSEEN→LEARNEDを確定させる
+  // (カードを表示しただけ・セッションを閉じただけではUNSEENのまま変化しない)。
+  async function proceedToSkillPractice() {
+    if (!skillSession) return;
+    setDrillError("");
+    setDrillLoading(true);
+    try {
+      const expressions = await loadExpressions();
+      const ids = skillSession.expressions.map(e => e.expressionId);
+      const updatedExpressions = markExpressionsLearned(expressions, ids);
+      await saveExpressions(updatedExpressions);
+      refreshExpressionStats();
+      const elements = skillSession.expressions.map(e => ({ id: e.expressionId, label: e.text, desc: e.meaning + (e.usage ? "(" + e.usage + ")" : "") }));
+      const classificationList = skillSession.expressions.map(e => ({ id: e.expressionId, label: e.text }));
+      try {
+        const probs = await generateSkillPracticeProblems(elements);
+        if (!Array.isArray(probs) || probs.length !== elements.length) {
+          throw new Error("skill practice problem count mismatch");
+        }
+        const problems = probs.map(p => ({ ...p, userAnswer: "" }));
+        setSkillSession(s => ({ ...s, stage: "answering", problems, classificationList, usedFallback: false }));
+      } catch (e) {
+        console.error("generateSkillPracticeProblems failed", e);
+        setDrillError("練習問題の生成に失敗しました。もう一度お試しください。");
+        setSkillSession(null);
+      }
+    } catch (e) {
+      setDrillError("練習の準備に失敗しました。");
+    }
+    setDrillLoading(false);
+  }
+
+  function cancelSkillTraining() {
+    // 何も保存しない。カード表示のみで終了した表現はUNSEENのまま。
+    setSkillSession(null);
+  }
+
+  function updateSkillAnswer(i, val) {
+    setSkillSession(s => {
+      const problems = s.problems.slice();
+      problems[i] = { ...problems[i], userAnswer: val };
+      return { ...s, problems };
+    });
+  }
+
+  async function submitSkillPracticeAnswers() {
+    setDrillLoading(true);
+    setDrillError("");
+    try {
+      const graded = await gradeSkillPracticeAnswers(skillSession.problems, skillSession.classificationList);
+      if (!Array.isArray(graded) || graded.length !== skillSession.problems.length) {
+        throw new Error("skill practice grading count mismatch");
+      }
+      const problems = skillSession.problems.map((p, i) => ({
+        ...p,
+        correct: graded[i].correct, correctedText: graded[i].correctedText, feedback: graded[i].feedback,
+        targetSkillAssessment: graded[i].targetSkillAssessment || "avoided",
+        errorType: graded[i].errorType || null, errorPattern: graded[i].errorPattern || null,
+      }));
+
+      // Expression状態更新: PRACTICED判定はアプリ側の純関数のみが行う。practicedCountは常に+1。
+      let expressions = await loadExpressions();
+      problems.forEach(p => {
+        const ex = expressions[p.elementId];
+        if (!ex) return;
+        expressions = { ...expressions, [p.elementId]: applySkillPracticeResult(ex, p.targetSkillAssessment) };
+      });
+      await saveExpressions(expressions);
+      refreshExpressionStats();
+
+      // Weakness登録: 実際の文法誤答(!correct)のみ。avoided(文法は正しいが回避)はWeaknessに登録しない。
+      const weaknessItems = problems.filter(p => !p.correct).map(p => ({
+        sourceType: "skillTraining", errorType: p.errorType, errorPattern: p.errorPattern,
+        topicId: null, lessonId: null,
+        originalSentence: p.japanese, correctedSentence: p.correctedText, explanation: p.feedback, ts: Date.now(),
+      }));
+      recordWeaknessOccurrences(weaknessItems);
+
+      appendDrillLog(problems.map(p => ({
+        ts: Date.now(), round: "skillTrainingExpression", sourceType: "skillTrainingExpression",
+        elementId: p.elementId, japanese: p.japanese, userAnswer: p.userAnswer, correct: p.correct,
+        targetSkillAssessment: p.targetSkillAssessment,
+      })));
+
+      setSkillSession({ ...skillSession, stage: "result", problems });
+    } catch (e) {
+      setDrillError("採点に失敗しました。もう一度お試しください。");
+    }
+    setDrillLoading(false);
+  }
+
+  function finishSkillSession() {
+    setSkillSession(null);
+  }
+
+  // Logic/Structure練習: ModelEssay承認済みTakeawayを使ったEXPANSION形式の練習。
+  // masteryState/Expression DBには一切触れない(Structures/Logic Takeaway自体は到達度を追跡しない)。
+  async function startExpansionSkillTraining() {
+    setDrillError("");
+    setDrillLoading(true);
+    try {
+      const essays = modelEssaysReady ? modelEssays : await loadModelEssays();
+      const picked = await pickSkillTrainingTakeaways(essays, ["structures", "logic"], SKILL_TRAINING_EXPANSION_COUNT);
+      if (picked.length === 0) { setDrillLoading(false); return; }
+      const probs = await generateExpansionPracticeProblems(picked);
+      if (!Array.isArray(probs) || probs.length !== picked.length) {
+        throw new Error("expansion practice problem count mismatch");
+      }
+      const problems = probs.map(p => ({ ...p, userAnswer: "" }));
+      setExpansionSession({ round: "skillTrainingExpansion", stage: "answering", problems });
+    } catch (e) {
+      console.error("startExpansionSkillTraining failed", e);
+      setDrillError("技法練習の準備に失敗しました。もう一度お試しください。");
+    }
+    setDrillLoading(false);
+  }
+
+  function updateExpansionAnswer(i, val) {
+    setExpansionSession(s => {
+      const problems = s.problems.slice();
+      problems[i] = { ...problems[i], userAnswer: val };
+      return { ...s, problems };
+    });
+  }
+
+  async function submitExpansionPractice() {
+    setDrillLoading(true);
+    setDrillError("");
+    try {
+      const graded = await gradeExpansionPractice(expansionSession.problems);
+      if (!Array.isArray(graded) || graded.length !== expansionSession.problems.length) {
+        throw new Error("expansion practice grading count mismatch");
+      }
+      const problems = expansionSession.problems.map((p, i) => ({
+        ...p, usedTechnique: !!graded[i].usedTechnique, feedback: graded[i].feedback, correctedText: graded[i].correctedText,
+      }));
+      appendDrillLog(problems.map(p => ({
+        ts: Date.now(), round: "skillTrainingExpansion", sourceType: "skillTrainingExpansion",
+        elementId: p.elementId, japanese: p.claim, userAnswer: p.userAnswer, correct: p.usedTechnique,
+      })));
+      setExpansionSession({ ...expansionSession, stage: "result", problems });
+    } catch (e) {
+      setDrillError("採点に失敗しました。もう一度お試しください。");
+    }
+    setDrillLoading(false);
+  }
+
+  function finishExpansionSession() {
+    setExpansionSession(null);
   }
 
   async function generateReviewBatchProblems(weaknessItems, classificationList, totalDue) {
@@ -2960,7 +3330,7 @@ function App() {
                 <button onClick={() => saveDrillState(drillState)} style={{ ...ghostBtn, whiteSpace: "nowrap" }}>今すぐ再送信</button>
               </div>
             )}
-            {!session && !finalCheckSession && !reviewSession && (() => {
+            {!session && !finalCheckSession && !reviewSession && !skillSession && !expansionSession && (() => {
               const lesson = LESSON_MAP[drillState.currentLessonId];
               const lessonState = lesson && drillState.lessonStates && drillState.lessonStates[lesson.lessonId];
               const status = lessonState ? lessonState.status : LESSON_STATUS.LEARNING;
@@ -3011,6 +3381,14 @@ function App() {
                       </button>
                     </div>
                   )}
+                  <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                    <button onClick={startExpressionSkillTraining} disabled={drillLoading} style={ghostBtnWide}>
+                      {drillLoading ? "準備中..." : "表現練習"}
+                    </button>
+                    <button onClick={startExpansionSkillTraining} disabled={drillLoading} style={ghostBtnWide}>
+                      {drillLoading ? "準備中..." : "構成・論理の技法練習"}
+                    </button>
+                  </div>
                   {masteryList.length > 0 && (
                     <div style={cardStyle}>
                       <div style={labelStyle}>要素別 定着度(誤答率が高い順)</div>
@@ -3078,6 +3456,27 @@ function App() {
                     : undefined
                 }
                 secondaryActionLabel={reviewSession.stage === "result" ? "次のバッチへ進む" : "再試行"}
+                loading={drillLoading}
+              />
+            )}
+            {skillSession && skillSession.stage === "cards" && (
+              <SkillTrainingCards session={skillSession} onProceed={proceedToSkillPractice} onCancel={cancelSkillTraining} loading={drillLoading} />
+            )}
+            {skillSession && skillSession.stage !== "cards" && (
+              <DrillSession
+                session={skillSession}
+                onAnswerChange={updateSkillAnswer}
+                onSubmit={submitSkillPracticeAnswers}
+                onFinish={finishSkillSession}
+                loading={drillLoading}
+              />
+            )}
+            {expansionSession && (
+              <ExpansionSession
+                session={expansionSession}
+                onAnswerChange={updateExpansionAnswer}
+                onSubmit={submitExpansionPractice}
+                onFinish={finishExpansionSession}
                 loading={drillLoading}
               />
             )}
