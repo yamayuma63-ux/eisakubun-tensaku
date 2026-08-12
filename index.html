@@ -51,6 +51,30 @@ window.storage = {
   },
 };
 
+// ---------- Phase 1 Foundation: schemaVersion管理 & 安全バックアップ ----------
+// 既存データは一切変更・削除しない。初回起動時のみスナップショットを追加保存する。
+const SCHEMA_VERSION = 1; // Phase 1ベースライン(データ構造そのものは未変更)
+(function ensureSchemaBackup() {
+  try {
+    const versionKey = "redpen:schema-version";
+    const existing = localStorage.getItem(versionKey);
+    if (existing === null) {
+      const snapshot = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("redpen:") && k !== versionKey && !k.startsWith("redpen:backup-")) {
+          snapshot[k] = localStorage.getItem(k);
+        }
+      }
+      const backupKey = "redpen:backup-phase0-" + Date.now();
+      localStorage.setItem(backupKey, JSON.stringify(snapshot));
+      localStorage.setItem(versionKey, String(SCHEMA_VERSION));
+    }
+  } catch (e) {
+    console.error("Phase 1 schema backup failed (non-fatal)", e);
+  }
+})();
+
 // ---------- APIキー管理 ----------
 const API_KEY_STORAGE_KEY = "redpen:anthropic_api_key";
 function getApiKey() {
