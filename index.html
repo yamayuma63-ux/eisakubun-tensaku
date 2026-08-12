@@ -960,6 +960,7 @@ function buildExpressionFromVocabEntry(vocab) {
     text: normalizeExpressionText(vocab.expression),
     meaning: vocab.meaning, usage: vocab.usage, example: vocab.example, caution: vocab.caution, category: vocab.category,
     origin: "curriculum", sourceVocabId: vocab.id,
+    sourceModelEssayIds: [], // Phase 10: ModelEssay承認によるsource参照。curriculum由来は空のまま
     masteryState: "UNSEEN",
     seenCount: 0, practicedCount: 0,
     producedCount: 0, producedEssayIds: [], producedDates: [],
@@ -1037,6 +1038,164 @@ function applyExpressionProductions(expressions, usedExpressionIds, essayKey, no
       ...next,
       [id]: { ...ex, producedEssayIds, producedDates, producedCount, firstProducedAt, lastProducedAt, masteryState, lastSeenAt: nowIso },
     };
+  });
+  return next;
+}
+
+// ---------- Phase 10: MODEL ESSAY LIBRARY (MASTER_SPEC PART 12) ----------
+// redpen:model-essays という独立localStorageキーに保存する。AI解析結果は必ずPreview(未承認)を経由し、
+// ユーザーが明示的に「承認」した項目だけがExpression Arsenal(Phase 9)へ反映される。
+// バックグラウンド自動反映は一切行わない。
+
+const MODEL_ESSAY_ANALYSIS_MAX_ITEMS = 4; // 各カテゴリ最大件数(大量抽出を避ける)
+const MODEL_ESSAY_SOURCE_CAP = 10; // Expression.sourceModelEssayIds のキャップ
+
+function computeModelEssayId() {
+  return "me-" + Date.now() + "-" + Math.floor(Math.random() * 1000);
+}
+
+// ---------- ModelEssay DB 専用アクセス層(drill-state/weaknesses/expressionsとは完全に独立) ----------
+async function loadModelEssays() {
+  try {
+    const r = await window.storage.get("model-essays", false);
+    if (r) return JSON.parse(r.value);
+  } catch (e) { console.error("loadModelEssays failed", e); }
+  return {};
+}
+async function saveModelEssays(modelEssays) {
+  try {
+    await window.storage.set("model-essays", JSON.stringify(modelEssays), false);
+  } catch (e) { console.error("saveModelEssays failed (non-fatal)", e); }
+}
+
+// 新規ModelEssayレコードを作成する(まだ解析していない状態)。
+function createModelEssay(fields) {
+  const nowIso = new Date().toISOString();
+  return {
+    id: computeModelEssayId(),
+    examType: fields.examType || "OTHER",
+    topic: fields.topic || "",
+    title: fields.title || "",
+    prompt: fields.prompt || "",
+    essay: fields.essay || "",
+    sourceType: fields.sourceType || "",
+    sourceName: fields.sourceName || "",
+    sourceURL: fields.sourceURL || "",
+    score: (typeof fields.score === "number") ? fields.score : null,
+    maxScore: (typeof fields.maxScore === "number") ? fields.maxScore : null,
+    evaluation: fields.evaluation || "",
+    notes: fields.notes || "",
+    origin: fields.origin === "AI_GENERATED" ? "AI_GENERATED" : "CURATED",
+    analysisStatus: "NOT_ANALYZED",
+    analysis: null,
+    approvalStatus: "NOT_APPLICABLE",
+    approvedExpressionIds: [],
+    approvedTakeaways: { structures: [], logic: [], organization: [] },
+    createdAt: nowIso, updatedAt: nowIso,
+  };
+}
+
+// 編集を既存レコードへ適用する。essay/prompt/examTypeのいずれかが変わった場合は、
+// 古い解析結果と本文がズレることを防ぐため、解析・承認状態をリセットする
+// (既に承認・作成済みのExpressionは削除・巻き戻ししない。ModelEssay側の状態のみ戻す)。
+function applyModelEssayEdit(existing, updatedFields) {
+  const nowIso = new Date().toISOString();
+  const merged = { ...existing, ...updatedFields, updatedAt: nowIso };
+  const contentChanged =
+    (updatedFields.essay !== undefined && updatedFields.essay !== existing.essay) ||
+    (updatedFields.prompt !== undefined && updatedFields.prompt !== existing.prompt) ||
+    (updatedFields.examType !== undefined && updatedFields.examType !== existing.examType);
+  if (contentChanged) {
+    merged.analysis = null;
+    merged.analysisStatus = "NOT_ANALYZED";
+    merged.approvalStatus = "NOT_APPLICABLE";
+    // approvedExpressionIds/approvedTakeawaysは意図的に消さない(過去の承認履歴の記録として残す)
+  }
+  return merged;
+}
+
+// AI解析。既存のcallClaudeRaw/withRetry/extractJsonSubstringパイプラインをそのまま再利用する。
+// 出力はプレビュー専用データであり、この関数自体はExpression DB等へは一切書き込まない。
+async function analyzeModelEssay(modelEssay) {
+  const sys = `あなたは英作文指導者です。以下の模範解答を分析し、他の学習に転用できる要素を抽出してください。
+大量に抽出せず、学習価値の高いものだけを各カテゴリ最大${MODEL_ESSAY_ANALYSIS_MAX_ITEMS}件に絞ってください。
+
+expressionsToSteal: 再利用可能な表現。カテゴリは次のいずれかから選んでください:
+${VOCAB_CATEGORIES.join(", ")}
+structuresToSteal: 参考になる構文・文構造のパターン
+logicToSteal: 参考になる論理展開・論証テクニック
+organizationToSteal: 参考になる構成・パラグラフ設計上の工夫
+
+以下のJSON形式のみを出力してください。説明やコードフェンスは付けないでください。
+{
+  "expressionsToSteal": [{"text": "表現(英語)", "meaning": "日本語の意味", "usage": "使いどころの説明", "category": "上記カテゴリのいずれか"}],
+  "structuresToSteal": [{"pattern": "構文パターンの説明", "explanation": "なぜ効果的か"}],
+  "logicToSteal": [{"technique": "論理展開の技法", "explanation": "なぜ効果的か"}],
+  "organizationToSteal": [{"point": "構成上の工夫", "explanation": "なぜ効果的か"}]
+}`;
+  const userContent = `設問:\n${modelEssay.prompt}\n\n模範解答:\n${modelEssay.essay}`;
+  const clean = await withRetry(() => callClaudeRaw(sys, userContent, 1600));
+  return JSON.parse(clean);
+}
+
+// ---------- Human Approval Gate: 承認された候補のみExpression Arsenalへ反映する ----------
+// approvedCandidates: [{text, meaning, usage, category}] — ユーザーがPreview上で確認・編集した最終値。
+// 未チェックの候補はこの配列に含まれない前提(呼び出し側でチェック済みのみ渡す)。
+//
+// 重複判定: computeExpressionId(text)が既存Expressionと一致する場合、
+//   text/meaning/usage/example/caution/masteryState/producedCount等の学習履歴は一切変更しない。
+//   sourceModelEssayIdsへのModelEssay ID追加のみ行う。
+// 完全新規の場合のみ、Preview値(text/meaning/usage/category)を初期データとして使用し、
+//   masteryState="UNSEEN"、origin="modelEssay"で作成する(example/cautionは分析結果に含まれないため空文字)。
+function applyApprovedExpressionCandidates(expressions, modelEssayId, approvedCandidates) {
+  let next = expressions;
+  const resultIds = [];
+  (approvedCandidates || []).forEach(cand => {
+    const text = normalizeExpressionText(cand.text);
+    if (!text) return;
+    const id = computeExpressionId(text);
+    resultIds.push(id);
+    const existing = next[id];
+    if (existing) {
+      // 既存Expressionの内容・学習履歴は一切書き換えない。source参照の追加のみ。
+      const sourceIds = existing.sourceModelEssayIds || [];
+      if (!sourceIds.includes(modelEssayId)) {
+        next = {
+          ...next,
+          [id]: { ...existing, sourceModelEssayIds: [...sourceIds, modelEssayId].slice(-MODEL_ESSAY_SOURCE_CAP) },
+        };
+      }
+      return;
+    }
+    // 完全新規の場合のみ、Preview値を初期データとして採用する
+    const nowIso = new Date().toISOString();
+    next = {
+      ...next,
+      [id]: {
+        expressionId: id, text,
+        meaning: cand.meaning || "", usage: cand.usage || "", example: "", caution: "",
+        category: VOCAB_CATEGORIES.includes(cand.category) ? cand.category : "opinion",
+        origin: "modelEssay", sourceVocabId: null, sourceModelEssayIds: [modelEssayId],
+        masteryState: "UNSEEN",
+        seenCount: 0, practicedCount: 0,
+        producedCount: 0, producedEssayIds: [], producedDates: [],
+        firstProducedAt: null, lastProducedAt: null,
+        createdAt: nowIso, lastSeenAt: nowIso,
+        lastReviewedAt: null, nextReviewAt: null, reviewCount: 0, correctCount: 0,
+      },
+    };
+  });
+  return { expressions: next, expressionIds: resultIds };
+}
+
+// ModelEssay削除時、Expression本体は一切削除せず、sourceModelEssayIdsから参照だけを外す。
+function removeModelEssayReferenceFromExpressions(expressions, modelEssayId) {
+  let next = expressions;
+  Object.keys(next).forEach(id => {
+    const ex = next[id];
+    if (ex.sourceModelEssayIds && ex.sourceModelEssayIds.includes(modelEssayId)) {
+      next = { ...next, [id]: { ...ex, sourceModelEssayIds: ex.sourceModelEssayIds.filter(x => x !== modelEssayId) } };
+    }
   });
   return next;
 }
@@ -1836,6 +1995,16 @@ function App() {
   // Phase 9: Expression Arsenal(習得表現)の簡易統計。新規タブ・新規UIコンポーネントは作らない。
   const [expressionStats, setExpressionStats] = useState({ producedOrAbove: 0, total: VOCAB_ENTRIES.length });
 
+  // Phase 10: Model Essay Library専用のstate(既存のdrill/freewrite等とは独立)
+  const [modelEssays, setModelEssays] = useState({});
+  const [modelEssaysReady, setModelEssaysReady] = useState(false);
+  const [modelEssayView, setModelEssayView] = useState("list"); // list | form | detail
+  const [selectedModelEssayId, setSelectedModelEssayId] = useState(null);
+  const [meFormFields, setMeFormFields] = useState(null);
+  const [analysisPreview, setAnalysisPreview] = useState(null);
+  const [meLoading, setMeLoading] = useState(false);
+  const [meError, setMeError] = useState("");
+
   // freewrite state
   const [freeWriteState, setFreeWriteState] = useState({ lastTs: null, usedThemes: [] });
   const [freeWriteReady, setFreeWriteReady] = useState(false);
@@ -1848,6 +2017,7 @@ function App() {
     if (view === "drill" && !drillReady) loadDrillState();
     if (view === "drill") refreshWeaknessDueCount();
     if (view === "drill") refreshExpressionStats();
+    if (view === "library" && !modelEssaysReady) loadModelEssaysList();
     if (view === "freewrite" && !freeWriteReady) loadFreeWriteState();
   }, [view]);
 
@@ -2273,6 +2443,173 @@ function App() {
     } catch (e) { console.error("refreshExpressionStats failed", e); }
   }
 
+  // ---------- Phase 10: MODEL ESSAY LIBRARY ----------
+  async function loadModelEssaysList() {
+    try {
+      const essays = await loadModelEssays();
+      setModelEssays(essays);
+    } catch (e) { console.error("loadModelEssaysList failed", e); }
+    setModelEssaysReady(true);
+  }
+
+  function startNewModelEssay() {
+    setMeFormFields({ examType: "OTHER", topic: "", title: "", prompt: "", essay: "", sourceType: "", sourceName: "", sourceURL: "", score: "", maxScore: "", notes: "", origin: "CURATED" });
+    setSelectedModelEssayId(null);
+    setMeError("");
+    setModelEssayView("form");
+  }
+
+  function startEditModelEssay(id) {
+    const me = modelEssays[id];
+    if (!me) return;
+    setMeFormFields({
+      examType: me.examType, topic: me.topic, title: me.title, prompt: me.prompt, essay: me.essay,
+      sourceType: me.sourceType, sourceName: me.sourceName, sourceURL: me.sourceURL,
+      score: me.score === null ? "" : String(me.score), maxScore: me.maxScore === null ? "" : String(me.maxScore),
+      notes: me.notes, origin: me.origin,
+    });
+    setSelectedModelEssayId(id);
+    setMeError("");
+    setModelEssayView("form");
+  }
+
+  function initAnalysisPreview(analysis) {
+    setAnalysisPreview({
+      expressions: (analysis.expressionsToSteal || []).map(x => ({
+        checked: false, text: x.text || "", meaning: x.meaning || "", usage: x.usage || "",
+        category: VOCAB_CATEGORIES.includes(x.category) ? x.category : "opinion",
+      })),
+      structures: (analysis.structuresToSteal || []).map(x => ({ checked: false, pattern: x.pattern || "", explanation: x.explanation || "" })),
+      logic: (analysis.logicToSteal || []).map(x => ({ checked: false, technique: x.technique || "", explanation: x.explanation || "" })),
+      organization: (analysis.organizationToSteal || []).map(x => ({ checked: false, point: x.point || "", explanation: x.explanation || "" })),
+    });
+  }
+
+  function viewModelEssayDetail(id) {
+    setSelectedModelEssayId(id);
+    const me = modelEssays[id];
+    if (me && me.analysisStatus === "ANALYZED" && me.analysis) {
+      initAnalysisPreview(me.analysis);
+    } else {
+      setAnalysisPreview(null);
+    }
+    setMeError("");
+    setModelEssayView("detail");
+  }
+
+  async function saveModelEssayForm() {
+    const fields = {
+      ...meFormFields,
+      score: meFormFields.score === "" ? null : Number(meFormFields.score),
+      maxScore: meFormFields.maxScore === "" ? null : Number(meFormFields.maxScore),
+    };
+    let next, targetId;
+    if (selectedModelEssayId && modelEssays[selectedModelEssayId]) {
+      const updated = applyModelEssayEdit(modelEssays[selectedModelEssayId], fields);
+      next = { ...modelEssays, [selectedModelEssayId]: updated };
+      targetId = selectedModelEssayId;
+    } else {
+      const created = createModelEssay(fields);
+      next = { ...modelEssays, [created.id]: created };
+      targetId = created.id;
+    }
+    setModelEssays(next);
+    await saveModelEssays(next);
+    viewModelEssayDetail(targetId);
+  }
+
+  async function deleteModelEssay(id) {
+    const next = { ...modelEssays };
+    delete next[id];
+    setModelEssays(next);
+    await saveModelEssays(next);
+    // Expression本体は削除せず、source参照だけを外す
+    try {
+      const expressions = await loadExpressions();
+      const updatedExpr = removeModelEssayReferenceFromExpressions(expressions, id);
+      await saveExpressions(updatedExpr);
+    } catch (e) { console.error("removeModelEssayReferenceFromExpressions failed", e); }
+    setSelectedModelEssayId(null);
+    setModelEssayView("list");
+  }
+
+  async function runModelEssayAnalysis(id) {
+    setMeLoading(true);
+    setMeError("");
+    const me = modelEssays[id];
+    if (!me) { setMeLoading(false); return; }
+    try {
+      const analysis = await analyzeModelEssay(me);
+      const updated = { ...me, analysis, analysisStatus: "ANALYZED", approvalStatus: "PENDING", updatedAt: new Date().toISOString() };
+      const next = { ...modelEssays, [id]: updated };
+      setModelEssays(next);
+      await saveModelEssays(next);
+      initAnalysisPreview(analysis);
+    } catch (e) {
+      console.error("analyzeModelEssay failed", e);
+      const failed = { ...me, analysisStatus: "ANALYSIS_FAILED" };
+      const next = { ...modelEssays, [id]: failed };
+      setModelEssays(next);
+      await saveModelEssays(next);
+      setMeError("解析に失敗しました。もう一度お試しください。");
+    }
+    setMeLoading(false);
+  }
+
+  function updateAnalysisPreviewItem(section, index, patch) {
+    setAnalysisPreview(prev => {
+      if (!prev) return prev;
+      const list = prev[section].slice();
+      list[index] = { ...list[index], ...patch };
+      return { ...prev, [section]: list };
+    });
+  }
+
+  // Human Approval Gate: チェック済み・ユーザーが確認/編集した最終値のみをExpression Arsenalへ反映する。
+  // AIの元analysis JSONを直接使わない(Preview値を必ず経由する)。
+  async function approveModelEssayTakeaways() {
+    if (!selectedModelEssayId || !analysisPreview) return;
+    setMeLoading(true);
+    setMeError("");
+    try {
+      const approvedExpressionCandidates = analysisPreview.expressions
+        .filter(x => x.checked)
+        .map(x => ({ text: x.text, meaning: x.meaning, usage: x.usage, category: x.category }));
+      let expressionIds = [];
+      if (approvedExpressionCandidates.length > 0) {
+        const expressions = await loadExpressions();
+        const result = applyApprovedExpressionCandidates(expressions, selectedModelEssayId, approvedExpressionCandidates);
+        await saveExpressions(result.expressions);
+        expressionIds = result.expressionIds;
+        refreshExpressionStats();
+      }
+      const strip = ({ checked, ...rest }) => rest;
+      const approvedStructures = analysisPreview.structures.filter(x => x.checked).map(strip);
+      const approvedLogic = analysisPreview.logic.filter(x => x.checked).map(strip);
+      const approvedOrganization = analysisPreview.organization.filter(x => x.checked).map(strip);
+
+      const me = modelEssays[selectedModelEssayId];
+      const updated = {
+        ...me,
+        approvalStatus: "APPROVED",
+        approvedExpressionIds: [...new Set([...(me.approvedExpressionIds || []), ...expressionIds])],
+        approvedTakeaways: {
+          structures: [...(me.approvedTakeaways?.structures || []), ...approvedStructures],
+          logic: [...(me.approvedTakeaways?.logic || []), ...approvedLogic],
+          organization: [...(me.approvedTakeaways?.organization || []), ...approvedOrganization],
+        },
+        updatedAt: new Date().toISOString(),
+      };
+      const next = { ...modelEssays, [selectedModelEssayId]: updated };
+      setModelEssays(next);
+      await saveModelEssays(next);
+    } catch (e) {
+      console.error("approveModelEssayTakeaways failed", e);
+      setMeError("承認処理に失敗しました。もう一度お試しください。");
+    }
+    setMeLoading(false);
+  }
+
   async function generateReviewBatchProblems(weaknessItems, classificationList, totalDue) {
     setDrillError("");
     setDrillWarning("");
@@ -2549,6 +2886,7 @@ function App() {
             <button onClick={() => setView("drill")} style={navBtn(view === "drill")}>特訓</button>
             <button onClick={() => setView("freewrite")} style={navBtn(view === "freewrite")}>自由作文</button>
             <button onClick={() => setView("history")} style={navBtn(view === "history")}>履歴</button>
+            <button onClick={() => setView("library")} style={navBtn(view === "library")}>教材</button>
             <button onClick={() => setView("settings")} style={navBtn(view === "settings")}>設定{!proxyUrlPresent && " ⚠"}</button>
           </nav>
         </header>
@@ -2885,6 +3223,164 @@ function App() {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {view === "library" && (
+          <div>
+            {meError && <div style={errBox}>{meError}</div>}
+
+            {modelEssayView === "list" && (
+              <div>
+                <div style={{ marginBottom: 14 }}>
+                  <button onClick={startNewModelEssay} style={primaryBtn(false)}>+ 新規登録</button>
+                </div>
+                {!modelEssaysReady && <div style={{ color: "#8A8478", fontSize: 13 }}>読み込み中...</div>}
+                {modelEssaysReady && Object.keys(modelEssays).length === 0 && (
+                  <div style={{ color: "#8A8478", fontSize: 13, textAlign: "center", padding: "40px 0" }}>まだ教材が登録されていません。「+ 新規登録」から追加できます。</div>
+                )}
+                {Object.values(modelEssays)
+                  .sort((a, b) => (a.origin === b.origin ? b.updatedAt.localeCompare(a.updatedAt) : (a.origin === "CURATED" ? -1 : 1)))
+                  .map(me => (
+                    <div key={me.id} style={{ ...cardStyle, marginBottom: 12, cursor: "pointer" }} onClick={() => viewModelEssayDetail(me.id)}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#8A8478", fontFamily: "'IBM Plex Mono', monospace" }}>
+                        <span>{me.examType}</span>
+                        <span>{me.origin === "CURATED" ? "CURATED" : "AI_GENERATED"}</span>
+                      </div>
+                      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 16, color: "#2A2620", marginTop: 4 }}>{me.title || "(無題)"}</div>
+                      <div style={{ fontSize: 12, color: "#8A8478", marginTop: 4 }}>
+                        {me.analysisStatus === "NOT_ANALYZED" && "未解析"}
+                        {me.analysisStatus === "ANALYZING" && "解析中..."}
+                        {me.analysisStatus === "ANALYZED" && (me.approvalStatus === "APPROVED" ? "解析済み・承認済み" : "解析済み・未承認")}
+                        {me.analysisStatus === "ANALYSIS_FAILED" && "解析失敗"}
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            )}
+
+            {modelEssayView === "form" && meFormFields && (
+              <div>
+                <div style={cardStyle}>
+                  <div style={labelStyle}>{selectedModelEssayId ? "教材を編集" : "新規教材登録"}</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 10 }}>
+                    <label style={{ fontSize: 12, color: "#8A8478" }}>Exam Type
+                      <select value={meFormFields.examType} onChange={e => setMeFormFields({ ...meFormFields, examType: e.target.value })} style={{ width: "100%", padding: 8, marginTop: 4, border: "1px solid #E7E0CE", borderRadius: 6 }}>
+                        <option value="EIKEN_PRE1">EIKEN_PRE1</option>
+                        <option value="JUNTENDO">JUNTENDO</option>
+                        <option value="EIKEN_1">EIKEN_1</option>
+                        <option value="OTHER">OTHER</option>
+                      </select>
+                    </label>
+                    <label style={{ fontSize: 12, color: "#8A8478" }}>Origin
+                      <select value={meFormFields.origin} onChange={e => setMeFormFields({ ...meFormFields, origin: e.target.value })} style={{ width: "100%", padding: 8, marginTop: 4, border: "1px solid #E7E0CE", borderRadius: 6 }}>
+                        <option value="CURATED">CURATED(自分で書いた・教科書等から)</option>
+                        <option value="AI_GENERATED">AI_GENERATED(AIに生成させた)</option>
+                      </select>
+                    </label>
+                    <input placeholder="Title" value={meFormFields.title} onChange={e => setMeFormFields({ ...meFormFields, title: e.target.value })} style={{ padding: 8, border: "1px solid #E7E0CE", borderRadius: 6 }} />
+                    <input placeholder="Topic" value={meFormFields.topic} onChange={e => setMeFormFields({ ...meFormFields, topic: e.target.value })} style={{ padding: 8, border: "1px solid #E7E0CE", borderRadius: 6 }} />
+                    <textarea placeholder="設問(Prompt)" value={meFormFields.prompt} onChange={e => setMeFormFields({ ...meFormFields, prompt: e.target.value })} style={{ minHeight: 60, padding: 8, border: "1px solid #E7E0CE", borderRadius: 6, fontFamily: "'Newsreader', serif" }} />
+                    <textarea placeholder="模範解答(Essay)" value={meFormFields.essay} onChange={e => setMeFormFields({ ...meFormFields, essay: e.target.value })} style={{ minHeight: 140, padding: 8, border: "1px solid #E7E0CE", borderRadius: 6, fontFamily: "'Newsreader', serif" }} />
+                    <input placeholder="Source Type(例: textbook / past-exam / self-written)" value={meFormFields.sourceType} onChange={e => setMeFormFields({ ...meFormFields, sourceType: e.target.value })} style={{ padding: 8, border: "1px solid #E7E0CE", borderRadius: 6 }} />
+                    <input placeholder="Source Name" value={meFormFields.sourceName} onChange={e => setMeFormFields({ ...meFormFields, sourceName: e.target.value })} style={{ padding: 8, border: "1px solid #E7E0CE", borderRadius: 6 }} />
+                    <input placeholder="Source URL" value={meFormFields.sourceURL} onChange={e => setMeFormFields({ ...meFormFields, sourceURL: e.target.value })} style={{ padding: 8, border: "1px solid #E7E0CE", borderRadius: 6 }} />
+                    <div style={{ display: "flex", gap: 10 }}>
+                      <input placeholder="Score" value={meFormFields.score} onChange={e => setMeFormFields({ ...meFormFields, score: e.target.value })} style={{ flex: 1, padding: 8, border: "1px solid #E7E0CE", borderRadius: 6 }} />
+                      <input placeholder="Max Score" value={meFormFields.maxScore} onChange={e => setMeFormFields({ ...meFormFields, maxScore: e.target.value })} style={{ flex: 1, padding: 8, border: "1px solid #E7E0CE", borderRadius: 6 }} />
+                    </div>
+                    <textarea placeholder="Notes" value={meFormFields.notes} onChange={e => setMeFormFields({ ...meFormFields, notes: e.target.value })} style={{ minHeight: 50, padding: 8, border: "1px solid #E7E0CE", borderRadius: 6, fontFamily: "'Newsreader', serif" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+                  <button onClick={() => setModelEssayView(selectedModelEssayId ? "detail" : "list")} style={ghostBtnWide}>キャンセル</button>
+                  <button onClick={saveModelEssayForm} disabled={!meFormFields.essay.trim() || !meFormFields.prompt.trim()} style={primaryBtn(!meFormFields.essay.trim() || !meFormFields.prompt.trim())}>保存</button>
+                </div>
+              </div>
+            )}
+
+            {modelEssayView === "detail" && selectedModelEssayId && modelEssays[selectedModelEssayId] && (() => {
+              const me = modelEssays[selectedModelEssayId];
+              return (
+                <div>
+                  <div style={cardStyle}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#8A8478", fontFamily: "'IBM Plex Mono', monospace" }}>
+                      <span>{me.examType}</span>
+                      <span>{me.origin}</span>
+                    </div>
+                    <div style={{ fontFamily: "'Fraunces', serif", fontSize: 20, color: "#2A2620", marginTop: 4 }}>{me.title || "(無題)"}</div>
+                    <div style={{ fontSize: 12, color: "#8A8478", marginTop: 4 }}>{me.sourceType}{me.sourceName ? " / " + me.sourceName : ""}{!me.sourceType && !me.sourceName ? "出典未記載" : ""}</div>
+                    <div style={{ fontFamily: "'Newsreader', serif", fontSize: 15, color: "#2A2620", marginTop: 10, whiteSpace: "pre-wrap" }}>{me.prompt}</div>
+                    <div style={{ fontFamily: "'Newsreader', serif", fontSize: 15, color: "#2A2620", marginTop: 10, whiteSpace: "pre-wrap", lineHeight: 1.8 }}>{me.essay}</div>
+                    {me.notes && <div style={{ fontSize: 12.5, color: "#5A5347", marginTop: 10, fontStyle: "italic" }}>{me.notes}</div>}
+                  </div>
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    <button onClick={() => startEditModelEssay(me.id)} style={ghostBtnWide}>編集</button>
+                    <button onClick={() => deleteModelEssay(me.id)} style={ghostBtnWide}>削除</button>
+                  </div>
+
+                  <div style={{ marginTop: 14 }}>
+                    <button onClick={() => runModelEssayAnalysis(me.id)} disabled={meLoading} style={primaryBtn(meLoading)}>
+                      {meLoading ? "解析中..." : (me.analysisStatus === "ANALYZED" ? "再解析する" : "AI解析する")}
+                    </button>
+                  </div>
+
+                  {analysisPreview && (
+                    <div style={{ marginTop: 14 }}>
+                      <div style={{ ...cardStyle, marginBottom: 12 }}>
+                        <div style={labelStyle}>Expressions to Steal(チェックした項目のみ登録されます)</div>
+                        {analysisPreview.expressions.length === 0 && <div style={{ fontSize: 12.5, color: "#8A8478" }}>該当なし</div>}
+                        {analysisPreview.expressions.map((x, i) => (
+                          <div key={i} style={{ borderTop: i > 0 ? "1px solid #E7E0CE" : "none", paddingTop: i > 0 ? 10 : 0, marginTop: i > 0 ? 10 : 0 }}>
+                            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                              <input type="checkbox" checked={x.checked} onChange={e => updateAnalysisPreviewItem("expressions", i, { checked: e.target.checked })} />
+                              <input value={x.text} onChange={e => updateAnalysisPreviewItem("expressions", i, { text: e.target.value })} style={{ flex: 1, padding: 6, border: "1px solid #E7E0CE", borderRadius: 4, fontFamily: "'IBM Plex Mono', monospace" }} />
+                            </label>
+                            <input placeholder="意味" value={x.meaning} onChange={e => updateAnalysisPreviewItem("expressions", i, { meaning: e.target.value })} style={{ width: "100%", padding: 6, marginTop: 4, border: "1px solid #E7E0CE", borderRadius: 4, fontSize: 12.5 }} />
+                            <input placeholder="使いどころ" value={x.usage} onChange={e => updateAnalysisPreviewItem("expressions", i, { usage: e.target.value })} style={{ width: "100%", padding: 6, marginTop: 4, border: "1px solid #E7E0CE", borderRadius: 4, fontSize: 12.5 }} />
+                            <select value={x.category} onChange={e => updateAnalysisPreviewItem("expressions", i, { category: e.target.value })} style={{ width: "100%", padding: 6, marginTop: 4, border: "1px solid #E7E0CE", borderRadius: 4, fontSize: 12.5 }}>
+                              {VOCAB_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+
+                      {[
+                        { key: "structures", label: "Structures to Steal", fields: ["pattern", "explanation"] },
+                        { key: "logic", label: "Logic to Steal", fields: ["technique", "explanation"] },
+                        { key: "organization", label: "Organization to Steal", fields: ["point", "explanation"] },
+                      ].map(section => (
+                        <div key={section.key} style={{ ...cardStyle, marginBottom: 12 }}>
+                          <div style={labelStyle}>{section.label}</div>
+                          {analysisPreview[section.key].length === 0 && <div style={{ fontSize: 12.5, color: "#8A8478" }}>該当なし</div>}
+                          {analysisPreview[section.key].map((x, i) => (
+                            <label key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 12.5, marginTop: i > 0 ? 8 : 0 }}>
+                              <input type="checkbox" checked={x.checked} onChange={e => updateAnalysisPreviewItem(section.key, i, { checked: e.target.checked })} style={{ marginTop: 3 }} />
+                              <span><b>{x[section.fields[0]]}</b> — {x[section.fields[1]]}</span>
+                            </label>
+                          ))}
+                        </div>
+                      ))}
+
+                      <button onClick={approveModelEssayTakeaways} disabled={meLoading} style={primaryBtn(meLoading)}>
+                        {meLoading ? "処理中..." : "承認して教材化"}
+                      </button>
+                    </div>
+                  )}
+
+                  {(me.approvedExpressionIds.length > 0 || me.approvedTakeaways.structures.length > 0 || me.approvedTakeaways.logic.length > 0 || me.approvedTakeaways.organization.length > 0) && (
+                    <div style={{ ...cardStyle, marginTop: 14 }}>
+                      <div style={labelStyle}>承認済み(この答案から学んだこと)</div>
+                      <div style={{ fontSize: 12.5, color: "#3A3529" }}>Expression: {me.approvedExpressionIds.length}件 / Structure: {me.approvedTakeaways.structures.length}件 / Logic: {me.approvedTakeaways.logic.length}件 / Organization: {me.approvedTakeaways.organization.length}件</div>
+                    </div>
+                  )}
+
+                  <div style={{ marginTop: 14 }}>
+                    <button onClick={() => setModelEssayView("list")} style={ghostBtnWide}>一覧に戻る</button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         )}
 
