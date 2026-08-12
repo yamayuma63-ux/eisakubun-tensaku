@@ -75,14 +75,24 @@ const SCHEMA_VERSION = 1; // Phase 1ベースライン(データ構造そのも�
   }
 })();
 
-// ---------- APIキー管理 ----------
-const API_KEY_STORAGE_KEY = "redpen:anthropic_api_key";
-function getApiKey() {
-  return localStorage.getItem(API_KEY_STORAGE_KEY) || "";
+// ---------- API Security Phase: Proxy URL管理(APIキーはブラウザに置かない) ----------
+const PROXY_URL_STORAGE_KEY = "redpen:proxy_url";
+const LEGACY_API_KEY_STORAGE_KEY = "redpen:anthropic_api_key";
+// 旧方式(ブラウザ内APIキー)は本Phaseで廃止。残っていれば一度だけ削除する。
+(function purgeLegacyApiKey() {
+  try {
+    if (localStorage.getItem(LEGACY_API_KEY_STORAGE_KEY) !== null) {
+      localStorage.removeItem(LEGACY_API_KEY_STORAGE_KEY);
+      console.info("Removed legacy browser-stored API key (moved to server-side proxy).");
+    }
+  } catch (e) { /* no-op */ }
+})();
+function getProxyUrl() {
+  return localStorage.getItem(PROXY_URL_STORAGE_KEY) || "";
 }
-function setApiKey(key) {
-  if (key) localStorage.setItem(API_KEY_STORAGE_KEY, key);
-  else localStorage.removeItem(API_KEY_STORAGE_KEY);
+function setProxyUrl(url) {
+  if (url) localStorage.setItem(PROXY_URL_STORAGE_KEY, url);
+  else localStorage.removeItem(PROXY_URL_STORAGE_KEY);
 }
 
 // ---------- word-level diff (simple LCS) ----------
@@ -349,17 +359,14 @@ async function withRetry(fn, times) {
 }
 
 async function callClaudeRaw(system, userContent, maxTokens) {
-  const apiKey = getApiKey();
-  if (!apiKey) {
-    throw new Error("APIキーが設定されていません。「設定」タブからAPIキーを入力してください。");
+  const proxyUrl = getProxyUrl();
+  if (!proxyUrl) {
+    throw new Error("Proxy URLが設定されていません。「設定」タブからCloudflare WorkerのURLを入力してください。");
   }
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch(proxyUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
@@ -609,9 +616,9 @@ function DrillSession({ session, onAnswerChange, onSubmit, onFinish, loading }) 
 
 function App() {
   const [view, setView] = useState("write"); // write | drill | freewrite | history | settings
-  const [apiKeyPresent, setApiKeyPresent] = useState(!!getApiKey());
-  const [apiKeyInput, setApiKeyInput] = useState(getApiKey());
-  const [apiKeySaved, setApiKeySaved] = useState(false);
+  const [proxyUrlPresent, setProxyUrlPresent] = useState(!!getProxyUrl());
+  const [proxyUrlInput, setProxyUrlInput] = useState(getProxyUrl());
+  const [proxyUrlSaved, setProxyUrlSaved] = useState(false);
   const [essay, setEssay] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -956,7 +963,7 @@ function App() {
             <button onClick={() => setView("drill")} style={navBtn(view === "drill")}>特訓</button>
             <button onClick={() => setView("freewrite")} style={navBtn(view === "freewrite")}>自由作文</button>
             <button onClick={() => setView("history")} style={navBtn(view === "history")}>履歴</button>
-            <button onClick={() => setView("settings")} style={navBtn(view === "settings")}>設定{!apiKeyPresent && " ⚠"}</button>
+            <button onClick={() => setView("settings")} style={navBtn(view === "settings")}>設定{!proxyUrlPresent && " ⚠"}</button>
           </nav>
         </header>
 
@@ -1228,38 +1235,38 @@ function App() {
         {view === "settings" && (
           <div>
             <div style={cardStyle}>
-              <div style={labelStyle}>Anthropic APIキー</div>
+              <div style={labelStyle}>Proxy Server URL</div>
               <div style={{ fontSize: 12.5, color: "#5A5347", lineHeight: 1.7, marginBottom: 12 }}>
-                console.anthropic.com で発行した「sk-ant-...」から始まるキーを貼り付けてください。この端末のブラウザ内にのみ保存され、外部には送信されません(AI呼び出し時にAnthropicへ直接送信されるのみです)。
+                AI呼び出しはCloudflare Worker経由で行われます(Anthropicの APIキーはサーバー側にのみ保管され、この端末には保存されません)。発行されたWorkerのURL(例: https://redpen-proxy.xxxx.workers.dev)を入力してください。
               </div>
               <input
-                type="password"
-                value={apiKeyInput}
-                onChange={(e) => { setApiKeyInput(e.target.value); setApiKeySaved(false); }}
-                placeholder="sk-ant-..."
+                type="text"
+                value={proxyUrlInput}
+                onChange={(e) => { setProxyUrlInput(e.target.value); setProxyUrlSaved(false); }}
+                placeholder="https://redpen-proxy.xxxx.workers.dev"
                 style={{ width: "100%", fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, color: "#2A2620", border: "1px solid #E7E0CE", borderRadius: 6, padding: 10, boxSizing: "border-box" }}
               />
               <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
                 <button
-                  onClick={() => { setApiKey(apiKeyInput.trim()); setApiKeyPresent(!!apiKeyInput.trim()); setApiKeySaved(true); }}
+                  onClick={() => { setProxyUrl(proxyUrlInput.trim()); setProxyUrlPresent(!!proxyUrlInput.trim()); setProxyUrlSaved(true); }}
                   style={primaryBtn(false)}
                 >
                   保存
                 </button>
                 <button
-                  onClick={() => { setApiKey(""); setApiKeyInput(""); setApiKeyPresent(false); setApiKeySaved(false); }}
+                  onClick={() => { setProxyUrl(""); setProxyUrlInput(""); setProxyUrlPresent(false); setProxyUrlSaved(false); }}
                   style={ghostBtn}
                 >
                   削除
                 </button>
               </div>
-              {apiKeySaved && <div style={{ fontSize: 12, color: "#2F5D50", marginTop: 8 }}>保存しました。</div>}
-              {!apiKeyPresent && <div style={{ fontSize: 12, color: "#B23A2E", marginTop: 8 }}>APIキーが未設定です。AI添削・問題生成が使えません。</div>}
+              {proxyUrlSaved && <div style={{ fontSize: 12, color: "#2F5D50", marginTop: 8 }}>保存しました。</div>}
+              {!proxyUrlPresent && <div style={{ fontSize: 12, color: "#B23A2E", marginTop: 8 }}>Proxy URLが未設定です。AI添削・問題生成が使えません。</div>}
             </div>
             <div style={{ ...cardStyle, marginTop: 14 }}>
               <div style={labelStyle}>データについて</div>
               <div style={{ fontSize: 12.5, color: "#5A5347", lineHeight: 1.8 }}>
-                学習履歴・進捗はこの端末のSafari内(localStorage)に保存されます。Safariの「履歴とWebサイトデータを消去」を行うと消えてしまうのでご注意ください。他の端末とは同期されません。
+                学習履歴・進捗はこの端末のSafari内(localStorage)に保存されます。Safariの「履歴とWebサイトデータを消去」を行うと消えてしまうのでご注意ください。他の端末とは同期されません。APIキー自体はこの端末には一切保存されません(Cloudflare Worker側にのみ保管)。
               </div>
             </div>
           </div>
