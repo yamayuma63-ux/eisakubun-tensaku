@@ -1,0 +1,1264 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Red Pen">
+<title>Red Pen - 英作文添削ノート</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Newsreader:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  html, body { margin: 0; padding: 0; background: #10161A; }
+  * { -webkit-tap-highlight-color: transparent; }
+  textarea, input { -webkit-appearance: none; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+// ---------- ローカル永続化(localStorage) ----------
+const LS_PREFIX = "redpen:";
+window.storage = {
+  async get(key, shared) {
+    const raw = localStorage.getItem(LS_PREFIX + (shared ? "shared:" : "") + key);
+    return raw === null ? null : { key, value: raw, shared: !!shared };
+  },
+  async set(key, value, shared) {
+    localStorage.setItem(LS_PREFIX + (shared ? "shared:" : "") + key, value);
+    return { key, value, shared: !!shared };
+  },
+  async delete(key, shared) {
+    localStorage.removeItem(LS_PREFIX + (shared ? "shared:" : "") + key);
+    return { key, deleted: true, shared: !!shared };
+  },
+  async list(prefix, shared) {
+    const base = LS_PREFIX + (shared ? "shared:" : "");
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(base)) {
+        const bare = k.slice(base.length);
+        if (!prefix || bare.startsWith(prefix)) keys.push(bare);
+      }
+    }
+    return { keys, prefix, shared: !!shared };
+  },
+};
+
+// ---------- APIキー管理 ----------
+const API_KEY_STORAGE_KEY = "redpen:anthropic_api_key";
+function getApiKey() {
+  return localStorage.getItem(API_KEY_STORAGE_KEY) || "";
+}
+function setApiKey(key) {
+  if (key) localStorage.setItem(API_KEY_STORAGE_KEY, key);
+  else localStorage.removeItem(API_KEY_STORAGE_KEY);
+}
+
+// ---------- word-level diff (simple LCS) ----------
+function tokenize(str) {
+  return (str.match(/\s+|[A-Za-z']+|[^\sA-Za-z']/g) || []);
+}
+function diffTokens(a, b) {
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push({ t: "eq", v: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ t: "del", v: a[i] }); i++; }
+    else { ops.push({ t: "ins", v: b[j] }); j++; }
+  }
+  while (i < n) { ops.push({ t: "del", v: a[i] }); i++; }
+  while (j < m) { ops.push({ t: "ins", v: b[j] }); j++; }
+  return ops;
+}
+
+const RUBRIC_KEYS = [
+  { key: "grammar", label: "文法" },
+  { key: "vocabulary", label: "語彙" },
+  { key: "structure", label: "構成" },
+  { key: "content", label: "内容" },
+  { key: "naturalness", label: "自然さ" },
+];
+
+// ---------- drill curriculum (習得順) ----------
+const CURRICULUM = [
+  { id: "L01", label: "第1講 伝達の表現", desc: "tell O to do/tell O1 O2、say⇔express、speak・talk(自動詞)⇔discuss(他動詞)、talk about A=discuss A、tell O about A、be told to do、People say that SV=It is said that SV=S is said to do" },
+  { id: "L02", label: "第2講 感覚・認識の表現", desc: "look/see、listen/hear、look C・look like A・look as if SV、sound C・sound like A、feel C・feel O doing・feel like A、understand/realize/recognize O、find (that) SV、find oneself doing" },
+  { id: "L03", label: "第3講 使役の表現", desc: "make O do(強制)、have O do(依頼)、let O do(許可)、be made to do、have[get] O done(依頼・被害・完了)、make oneself understood、keep O doing/done、leave O doing/done、help O (to) do" },
+  { id: "L05", label: "第5講 時の表現①", desc: "for the first time/at first、not...until~=it is not until~that、until⇔by、in+期間、A期間 after...、nowadays/these days+現在形、recently/lately+現在完了、once SV、過去完了と過去形の使い分け" },
+  { id: "L06", label: "第6講 時の表現②", desc: "進行形の受動態(be being done)、完了形の受動態(have been done)、It has been A since SV、be about to do、現在完了(経験・完了)と現在完了進行形、過去完了(had done)、by the time SV+未来完了" },
+  { id: "L07", label: "第7講「…になる」の表現", desc: "grow/get/become+C、go+C(bad/wrong)、turn+年齢、turn[change] into A、come to do(徐々に)、begin[start] to do、learn to do、end up doing、S mean that SV、it doesn't mean[follow] that~" },
+  { id: "L09", label: "第9講 存在の表現", desc: "there is/are、there is nothing+形容詞+about A、there is no point[use/sense] in doing、remain to be done、there is no A=they have no A、lie in A=be located in A、there are likely to be A" },
+  { id: "L10", label: "第10講「もの・こと」の表現", desc: "it is up to A to do、find it 形容詞 to do、動名詞主語、what SV is that SV、it doesn't matter wh-節、whether...or not(主語)、the trouble with A is that SV、something+形容詞の語順" },
+  { id: "L11", label: "第11講 叙述の表現", desc: "be sure/apt[liable] to do、形容詞+enough to do=have enough+名詞+to do、seem to do、depressing⇔depressed、tough構文(easy/difficult to do)、it is 形容詞+of A to do、it is important that S (should) do" },
+  { id: "L13", label: "第13講 比較の表現①", desc: "not as+原級+as、the+最上級+in X、no other+B+as+原級+as A、no other+B+比較級+than A、最上級相当表現、never...as+原級+as when SV、such a+形容詞+名詞+as、Never before have S been(倒置)" },
+  { id: "L14", label: "第14講 比較の表現②", desc: "X times as+原級+as、the+比較級, the+比較級、more and more A doing=the number of A doing is increasing、much/far/a lot+比較級、all the+比較級+because SV、as+原級+as possible/as S can" },
+];
+const ELEMENT_MAP = Object.fromEntries(CURRICULUM.map(e => [e.id, e]));
+const CURRICULUM_VERSION = 3; // v3: 30日ペース進行+一周後ランダム化に対応
+const DAYS_TO_COMPLETE_CYCLE = 30;
+
+// AI生成が失敗した場合の予備問題(150問、講ごとに満遍なく13〜14問ずつ)。教材の基本文例をベースに作成。
+const FALLBACK_PROBLEMS = {
+  L01: [
+    { japanese: "彼は私に、明日ご連絡できるように、電話番号を教えてもらえませんかと言った。", modelAnswer: "He asked me to tell him my phone number so that he could contact me the next day." },
+    { japanese: "彼は思っていることを言わなかった。", modelAnswer: "He didn't say what he was thinking." },
+    { japanese: "声が聞き取りにくいので、もう少し大きな声で話してください。", modelAnswer: "Please speak a little louder." },
+    { japanese: "私たちは夕食を食べながら将来の計画について話し合った。", modelAnswer: "We talked about our future plans over dinner." },
+    { japanese: "彼女は私に自分の子どもたちのことについて、どんなに愛しているかを語った。", modelAnswer: "She told me about her children and how much she loved them." },
+    { japanese: "オーストラリアでは英語を話す。", modelAnswer: "They speak English in Australia." },
+    { japanese: "うそをついてはいけません。本当のことを言いなさい。", modelAnswer: "Don't tell lies. Tell the truth." },
+    { japanese: "父とその件について話し合いたい。", modelAnswer: "I want to talk over the matter with my father." },
+    { japanese: "彼は教え子と結婚したと言われている。", modelAnswer: "He is said to have married one of his former students." },
+    { japanese: "医者は私に酒とタバコをやめるように言った。", modelAnswer: "The doctor told me to stop drinking and smoking." },
+    { japanese: "私は、言われたとおりにその宿題をした。", modelAnswer: "I did the assignment just as I was told to." },
+    { japanese: "彼はその知らせを聞いて何と言っていましたか。", modelAnswer: "What did he say when he heard the news?" },
+    { japanese: "彼女は自分の意見をはっきりと述べた。", modelAnswer: "She expressed her opinion clearly." },
+    { japanese: "彼はそのニュースについて誰にも話さなかった。", modelAnswer: "He didn't talk to anyone about the news." },
+  ],
+  L02: [
+    { japanese: "窓の外を見たが、屋根以外何も見えなかった。", modelAnswer: "I looked out of the window, but I could see nothing but roofs." },
+    { japanese: "耳を澄ませば、外で雨が降っているのが聞こえるよ。", modelAnswer: "If you listen carefully, you can hear the rain falling outside." },
+    { japanese: "彼女はそのフットボールの試合に興奮しているように見えた。", modelAnswer: "She looked excited by the football game." },
+    { japanese: "彼は教授のような風采だ。", modelAnswer: "He looks like a professor." },
+    { japanese: "彼はまるで幽霊を見たかのような顔をしていた。", modelAnswer: "He looked as if he had seen a ghost." },
+    { japanese: "彼の提案はずいぶん奇妙に聞こえたので、みんなが大笑いをした。", modelAnswer: "His suggestion sounded so strange that everyone laughed out loud." },
+    { japanese: "それはいい考えのようだ。", modelAnswer: "That sounds like a good idea." },
+    { japanese: "風邪をひいているような声だね。", modelAnswer: "You sound as if you have a cold." },
+    { japanese: "私は子どもたちと遊んでいると楽しい。", modelAnswer: "I feel happy when I play with children." },
+    { japanese: "ふと脚を虫が這っている感じがした。", modelAnswer: "I suddenly felt an insect crawling up my leg." },
+    { japanese: "なぜ彼女がそんなにお金を使うのかわからない。", modelAnswer: "I cannot understand why she spends so much money." },
+    { japanese: "はじめ彼だとわからなかった。20年以上も会っていなかったから。", modelAnswer: "I didn't recognize him at first; I hadn't seen him for more than twenty years." },
+    { japanese: "そのコンピュータはとても高いことがわかった。", modelAnswer: "I found (that) the computer was very expensive." },
+    { japanese: "君の手はとても冷たい感じがする。まるで氷のような感じだ。", modelAnswer: "Your hand feels very cold; it feels like ice." },
+  ],
+  L03: [
+    { japanese: "先生は彼に一生懸命勉強させた。", modelAnswer: "The teacher made him study hard." },
+    { japanese: "戻りましたら、彼に電話をかけ直させましょうか。", modelAnswer: "Shall I have him call you back when he gets back?" },
+    { japanese: "彼女はヨーロッパ旅行をしたがったが、父親はどうしても行かせなかった。", modelAnswer: "She wanted to go on a trip to Europe, but her father wouldn't let her go." },
+    { japanese: "彼らは先輩のユニフォームを洗わされた。", modelAnswer: "They were made to wash the older players' uniforms." },
+    { japanese: "彼女は歯を抜いてもらったので、とても痛がっていました。", modelAnswer: "She was in great pain because she had had a tooth pulled out." },
+    { japanese: "昨夜家に帰る途中、電車の中で眠っているうちにカバンを盗まれた。", modelAnswer: "On my way home last night I had my bag stolen while I was sleeping in the train." },
+    { japanese: "お戻りになるまでには、この仕事を終えておきます。", modelAnswer: "I'll get this work finished by the time you come back." },
+    { japanese: "ロンドン滞在中は英語でわかってもらうのに苦労した。", modelAnswer: "During my stay in London I had trouble making myself understood in English." },
+    { japanese: "どうして彼女がまだ20代だと思ったのですか。", modelAnswer: "What made you think that she was still in her twenties?" },
+    { japanese: "長らくお待たせしてすみませんでした。", modelAnswer: "I'm sorry to have kept you waiting so long." },
+    { japanese: "仕事を中途半端にしておいてはいけない。", modelAnswer: "Don't leave your work half finished." },
+    { japanese: "外国語を勉強すると、他の国の人々の考え方を理解するのに役立つ。", modelAnswer: "Learning a foreign language helps you (to) understand how people in other countries think." },
+    { japanese: "彼にドアを開けさせてください。", modelAnswer: "Let him open the door." },
+    { japanese: "彼女は子どもたちに自分で決めさせている。", modelAnswer: "She lets her children decide for themselves." },
+  ],
+  L05: [
+    { japanese: "初めて鯨を見たとき、最初それが何だかわかりませんでした。", modelAnswer: "When I saw a whale for the first time, I couldn't tell what it was at first." },
+    { japanese: "ここに来たのは今回が初めてですか?", modelAnswer: "Is this the first time you've been here?" },
+    { japanese: "彼が私のもとを去ってはじめて、自分がいかに深く彼のことを愛しているかに気づいた。", modelAnswer: "I did not realize how deeply I loved him until he had left me." },
+    { japanese: "6時まで待っていてください。それまでには戻りますから。", modelAnswer: "Please wait until six. I'll be back by that time." },
+    { japanese: "2、3ヶ月で外国語をものにするなんて、不可能です。", modelAnswer: "It is impossible to learn a foreign language in a few months." },
+    { japanese: "息子が大学に入学してから一ヶ月ほど後に、彼から電話があり、一週間後に帰郷すると伝えてきた。", modelAnswer: "About a month after my son entered university, he gave me a call saying that he would come home in a week." },
+    { japanese: "近ごろはこれまで以上に暮らしにくくなっている。", modelAnswer: "Nowadays life is getting even harder." },
+    { japanese: "このところ仕事が忙しくて十分な睡眠がとれていないんです。", modelAnswer: "Recently I haven't had enough sleep because of my job." },
+    { japanese: "一度約束したら、たとえ守るのが難しいとわかっても、破るべきではない。", modelAnswer: "Once you make a promise, you should not break it even if you find it hard to keep it." },
+    { japanese: "先日、小学生の時に住んでいた町のことを考えながら、何時間も過ごしてしまった。", modelAnswer: "The other day I spent many hours thinking about the town where we had lived when I was in primary school." },
+    { japanese: "彼女は今回で3度目の来日だ。", modelAnswer: "This is the third time she has visited Japan." },
+    { japanese: "私が家を出るまでには、雨は止んでいるだろう。", modelAnswer: "By the time I leave home, the rain will have stopped." },
+    { japanese: "彼と最後に会ってから10年が経つ。", modelAnswer: "It has been ten years since I last saw him." },
+    { japanese: "彼が空港に着くまでには、飛行機はもう出発していた。", modelAnswer: "By the time he arrived at the airport, the plane had already left." },
+  ],
+  L06: [
+    { japanese: "近ごろは、海外留学する日本人学生の数が減っている。", modelAnswer: "Nowadays the number of Japanese students who go abroad to study is decreasing." },
+    { japanese: "大きなスーパーが近所に建設中なので、もうすぐ手ごろな値段で買い物ができるようになります。", modelAnswer: "A large supermarket is being built near my house, so soon we'll be able to buy things at reasonable prices." },
+    { japanese: "昨日の台風で、この地区のたくさんの建物が壊されてしまった。", modelAnswer: "Due to the typhoon yesterday, a lot of buildings in this neighborhood have been destroyed." },
+    { japanese: "実家を離れてから5年になります。", modelAnswer: "It has been five years since I left home." },
+    { japanese: "彼が駅に着いたとき、ちょうど終電が出るところだった。", modelAnswer: "The last train was about to leave when he arrived at the station." },
+    { japanese: "ひどい風邪をひいた時は、たいてい健康管理を十分にしていなかったせいである。", modelAnswer: "When you have caught a bad cold, it is usually because you haven't been taking enough care of yourself." },
+    { japanese: "彼が医者にかかったとき、すでに発病してひと月も経っていた。", modelAnswer: "He had been sick for a month when he finally consulted a doctor." },
+    { japanese: "彼が元気になるまでには、2、3週間かかるでしょう。", modelAnswer: "It will be two or three weeks before he gets better." },
+    { japanese: "あなたが戻るまでには、彼はあなたの車を直してしまっているでしょう。", modelAnswer: "He will have repaired your car by the time you get back." },
+    { japanese: "先月、10年ぶりに故郷に帰った。", modelAnswer: "Last month I went back to my hometown for the first time in ten years." },
+    { japanese: "空港に着いたときには、すでに搭乗が始まっていた。", modelAnswer: "Boarding had already started by the time we arrived at the airport." },
+    { japanese: "その橋は現在修理中だ。", modelAnswer: "The bridge is currently being repaired." },
+    { japanese: "彼女はこれまでに3回この本を読んだことがある。", modelAnswer: "She has read this book three times so far." },
+  ],
+  L07: [
+    { japanese: "人は高齢になるにつれて、頑固になる。", modelAnswer: "As you grow older, you become more obstinate." },
+    { japanese: "肉はすぐ悪くなるから、できるだけ早く食べてね。", modelAnswer: "Meat goes bad quickly, so eat it as soon as possible." },
+    { japanese: "彼は20歳になる前に、親元を離れて東京に引っ越した。", modelAnswer: "He left home and moved to Tokyo before he turned twenty." },
+    { japanese: "ものすごく大きな圧力をかけると、炭素はダイヤモンドになる。", modelAnswer: "Under enormous pressure, carbon turns into diamond." },
+    { japanese: "はじめ彼女は彼のことが好きではなかったが、一緒に仕事をしているうちに、二人はお互いを愛するようになった。", modelAnswer: "At first she didn't like him, but while they were working together, they came to love each other." },
+    { japanese: "最近、日本の国立大学は、外国人を教授に雇うようになってきた。", modelAnswer: "Recently Japanese national universities have begun to hire foreigners as professors." },
+    { japanese: "たった2日の練習で、パソコンが使えるようになったの?", modelAnswer: "Did you learn to use a personal computer after only two days' practice?" },
+    { japanese: "そんなにがんばって働き続けたら、病気になってしまうよ。", modelAnswer: "You'll probably end up getting sick if you go on working so hard." },
+    { japanese: "この状況では、私たちは危険を冒して徹夜で車を走らせないといけないことになる。", modelAnswer: "This situation means that we'll have to run a risk and drive all night long." },
+    { japanese: "金持ちになったからといって、幸せになれるということにはならない。", modelAnswer: "Just because you become rich, it doesn't mean that you can be happy." },
+    { japanese: "彼女は医者になるために猛勉強した。", modelAnswer: "She studied hard to become a doctor." },
+    { japanese: "天気は急に悪くなった。", modelAnswer: "The weather suddenly turned bad." },
+    { japanese: "その少年はやがて有名な音楽家になった。", modelAnswer: "The boy eventually became a famous musician." },
+    { japanese: "練習を重ねるうちに、彼のフランス語はどんどん上達するようになった。", modelAnswer: "As he kept practicing, his French kept getting better and better." },
+  ],
+  L09: [
+    { japanese: "関東地方は明日は雨でしょう。", modelAnswer: "Tomorrow there will be rain in the Kanto district." },
+    { japanese: "我が社には、コンピュータを仕事で使っている人がたくさんいる。", modelAnswer: "In our company, there are lots of people who use computers in their jobs." },
+    { japanese: "「私の絵の描き方には、何も変わったところはありません」と画家は言った。", modelAnswer: "The painter said, \"There is nothing unusual about the way I paint pictures.\"" },
+    { japanese: "それをやってみることに意味があるなんて、本当に思うの?", modelAnswer: "Do you really think there's any point in giving it a try?" },
+    { japanese: "地球温暖化をどう阻止するかに関しては、解決されるべき問題がまだたくさんある。", modelAnswer: "There are still many problems to be solved as to how to stop global warming." },
+    { japanese: "アメリカ合衆国では、土曜と日曜には学校がない。", modelAnswer: "There is no school on Saturdays and Sundays in the United States." },
+    { japanese: "もう一つお話ししたいことがあるのですが。", modelAnswer: "I have another thing to talk to you about." },
+    { japanese: "札幌は日本の北部にあります。", modelAnswer: "Sapporo lies in the north of Japan." },
+    { japanese: "毎年この時期になると、全国各地でこうしたお祭りがあります。", modelAnswer: "At this time of the year, festivals like this are held in many parts of the country." },
+    { japanese: "スマホがさらに発達することによって、コミュニケーションの仕方に今後大きな変化が起こるだろう。", modelAnswer: "Because of the further developments in the smartphone, there are likely to be great changes in the way we communicate." },
+    { japanese: "この町には図書館が一つしかない。", modelAnswer: "There is only one library in this town." },
+    { japanese: "彼の話には何の根拠もない。", modelAnswer: "There is no basis for what he says." },
+    { japanese: "京都には訪れる価値のある寺がたくさんある。", modelAnswer: "There are many temples worth visiting in Kyoto." },
+    { japanese: "この街には大きな公園がいくつかある。", modelAnswer: "There are several large parks in this city." },
+  ],
+  L10: [
+    { japanese: "結婚して子どもを持つかどうかを決めるのは、一人一人の問題である。", modelAnswer: "It is up to each individual to decide whether or not to marry and have children." },
+    { japanese: "話をするととても気持ちのいい人だから、君が新しい上司と仲良くやっていくのは難しいことじゃないよ。", modelAnswer: "You'll find it easy to get along with your new boss, since he is very pleasant to talk to." },
+    { japanese: "駅前でギターを弾きながら歌を歌うのが、兄の一番の楽しみなのです。", modelAnswer: "Singing songs while playing the guitar in front of the station is my brother's greatest pleasure." },
+    { japanese: "彼女のことで一番感心するのは、彼女がとても知的だということです。", modelAnswer: "What strikes me most about her is that she is quite intellectual." },
+    { japanese: "きれいになりさえすれば、誰がその部屋の掃除をするかは問題ではない。", modelAnswer: "It doesn't matter who cleans the room, just as long as it gets cleaned." },
+    { japanese: "その試験に受かるかどうかは、君がどれだけ一生懸命に勉強するかにかかっている。", modelAnswer: "Whether you can pass the exam or not depends on how hard you study." },
+    { japanese: "うちの息子で困るのは、どうしても私の言うことに耳を貸そうとしないことだ。", modelAnswer: "The trouble with my son is that he won't listen to me." },
+    { japanese: "彼を怒らせるようなことは、何一つ言わないように気をつけた。", modelAnswer: "I was careful not to say anything that would make him angry." },
+    { japanese: "空から白いものが降ってくるのが見えたが、それは季節外れの雪だった。", modelAnswer: "I saw something white falling from the sky — it was unseasonable snow." },
+    { japanese: "多くの動物は、人間が気がつかないさまざまなものを感知することができる。", modelAnswer: "Many animals can sense things which human beings are not aware of." },
+    { japanese: "大切なのは、諦めずに挑戦し続けることだ。", modelAnswer: "What matters is to keep trying without giving up." },
+    { japanese: "彼が遅刻した理由は誰にもわからない。", modelAnswer: "Why he was late is a mystery to everyone." },
+    { japanese: "何をすべきかは状況次第だ。", modelAnswer: "What you should do depends on the situation." },
+  ],
+  L11: [
+    { japanese: "今度は必ず妹さんを連れてきてね。", modelAnswer: "Be sure to bring your sister next time." },
+    { japanese: "彼はつまらない間違いをしがちだ。", modelAnswer: "He is apt to make silly mistakes." },
+    { japanese: "彼女は困っている人をいつも親切に助けてあげる。", modelAnswer: "She is always kind enough to help people in trouble." },
+    { japanese: "彼はその結果に満足しているようだ。", modelAnswer: "He seems to be satisfied with the result." },
+    { japanese: "多くの興奮した観衆が選手に物を投げつけ始めるのを見て、ほんとうに気が滅入った。", modelAnswer: "It was really depressing to see a lot of excited spectators begin to throw things at the players." },
+    { japanese: "悪い習慣は、身につけるのは簡単だが、直すのは難しい。", modelAnswer: "Bad habits are easy to acquire but difficult to get rid of." },
+    { japanese: "そこへはバスを使うのが便利ですよ。", modelAnswer: "It would be convenient for you to take the bus there." },
+    { japanese: "旅行を延期したのは賢明だったね。", modelAnswer: "It was sensible of you to put off the trip." },
+    { japanese: "全員が事実をすべて知らされることが重要だ。", modelAnswer: "It is important that everybody be told all the facts." },
+    { japanese: "彼女の手紙に彼が腹を立てたのも、当然のことだ。", modelAnswer: "It is hardly surprising that he was offended by her letter." },
+    { japanese: "彼女は約束を破るような人ではない。", modelAnswer: "She is not the kind of person who breaks promises." },
+    { japanese: "子供が一人で外出するのは危険だ。", modelAnswer: "It is dangerous for a child to go out alone." },
+    { japanese: "彼がそのミスに気づかなかったのは不思議だ。", modelAnswer: "It is strange that he didn't notice the mistake." },
+    { japanese: "誰もが時には間違いを犯しがちだ。", modelAnswer: "Everyone is apt to make mistakes sometimes." },
+  ],
+  L13: [
+    { japanese: "その女優は見かけほど若くはない。", modelAnswer: "The actress is not as young as she looks." },
+    { japanese: "困ったことに、彼は昔ほど一生懸命に働いていない。", modelAnswer: "The trouble is that he doesn't work as hard as he used to." },
+    { japanese: "試験は思ったほど難しくなかったのでほっとした。", modelAnswer: "To my relief, the exam was not as hard as I had expected." },
+    { japanese: "エベレストは世界で最も高い山だ。", modelAnswer: "Mt. Everest is the highest mountain in the world." },
+    { japanese: "時間は最も貴重なものである。", modelAnswer: "Time is the most precious of all." },
+    { japanese: "イギリスの天気は世界で最も変わりやすい。", modelAnswer: "The weather in Britain is the most changeable in the world." },
+    { japanese: "私は自分の部屋で音楽を聴いているときが一番幸せを感じる。", modelAnswer: "I feel happiest when I am listening to music in my room." },
+    { japanese: "こんな寒い冬は初めてだ。", modelAnswer: "This is the coldest winter that we have ever had." },
+    { japanese: "高等教育の重要性が今日ほど大きくなったことはなかった。", modelAnswer: "Never before has higher education been as important as it is today." },
+    { japanese: "あなたと初めて会った日のことを、今でもまるで昨日のことのように覚えています。", modelAnswer: "I still remember the day when I first met you as clearly as if it were yesterday." },
+    { japanese: "彼ほど頼りになる友人はいない。", modelAnswer: "No friend is as reliable as him." },
+    { japanese: "これは私が今まで読んだ中で一番おもしろい本だ。", modelAnswer: "This is the most interesting book I have ever read." },
+    { japanese: "彼女ほど熱心に勉強する生徒はクラスにいない。", modelAnswer: "No student in the class studies as hard as she does." },
+  ],
+  L14: [
+    { japanese: "中国の人口は日本の約10倍である。", modelAnswer: "The population of China is about ten times as large as that of Japan." },
+    { japanese: "今日の世界の人口は40年前の2倍である。", modelAnswer: "The population of the world today is twice as large as it was 40 years ago." },
+    { japanese: "地下鉄を利用すればバスの3分の1の時間でそこに行けます。", modelAnswer: "By subway, you can get there in a third as much time as by bus." },
+    { japanese: "日本人は自分の意見をできるだけ遠回しに伝える傾向がある。", modelAnswer: "The Japanese tend to express their opinions as indirectly as they can." },
+    { japanese: "若いうちにできるだけ多くの本を読みなさい。", modelAnswer: "Read as many books as you can while you are young." },
+    { japanese: "祖父は年をとればとるほど、頑固になった。", modelAnswer: "The older my grandfather grew, the more obstinate he got." },
+    { japanese: "最近タバコをやめる人がますます増えている。", modelAnswer: "Nowadays more and more people are giving up smoking." },
+    { japanese: "この冬は例年よりはるかに雪が多かった。", modelAnswer: "This winter it snowed much more than usual." },
+    { japanese: "学生がうるさかったので、先生はいっそう大声で話さなければならなかった。", modelAnswer: "The teacher had to speak all the louder because the students were noisy." },
+    { japanese: "彼は1,000冊を超える本を持っているが、僕はそんなには持っていない。", modelAnswer: "He has more than 1,000 books, but I don't have as many." },
+    { japanese: "この地域の人口は年々増加している。", modelAnswer: "The population of this area is increasing year by year." },
+    { japanese: "忙しければ忙しいほど、時間の使い方が上手になる。", modelAnswer: "The busier you are, the better you get at managing your time." },
+    { japanese: "できるだけ早くこの仕事を終わらせてください。", modelAnswer: "Please finish this work as soon as possible." },
+  ],
+};
+function getFallbackProblems(elements) {
+  const used = {};
+  return elements.map(el => {
+    const bank = FALLBACK_PROBLEMS[el.id] || [{ japanese: `(${el.label}を使った文を作って訳してください)`, modelAnswer: "" }];
+    const idx = (used[el.id] || 0) % bank.length;
+    used[el.id] = (used[el.id] || 0) + 1;
+    return { elementId: el.id, japanese: bank[idx].japanese, modelAnswer: bank[idx].modelAnswer };
+  });
+}
+
+function extractJsonSubstring(text) {
+  const firstObj = text.indexOf("{");
+  const firstArr = text.indexOf("[");
+  let start = -1;
+  if (firstObj === -1) start = firstArr;
+  else if (firstArr === -1) start = firstObj;
+  else start = Math.min(firstObj, firstArr);
+  if (start === -1) return text;
+  const openChar = text[start];
+  const closeChar = openChar === "{" ? "}" : "]";
+  const lastClose = text.lastIndexOf(closeChar);
+  if (lastClose === -1 || lastClose < start) return text;
+  return text.slice(start, lastClose + 1);
+}
+
+async function withRetry(fn, times) {
+  let lastErr;
+  const n = times || 2;
+  for (let i = 0; i < n; i++) {
+    try { return await fn(); } catch (e) {
+      lastErr = e;
+      console.error("withRetry attempt " + (i + 1) + " failed", e);
+      if (i < n - 1) await new Promise(r => setTimeout(r, 500));
+    }
+  }
+  throw lastErr;
+}
+
+async function callClaudeRaw(system, userContent, maxTokens) {
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    throw new Error("APIキーが設定されていません。「設定」タブからAPIキーを入力してください。");
+  }
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: maxTokens || 1000,
+      system,
+      messages: [{ role: "user", content: userContent }],
+    }),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try { const errJson = await res.json(); detail = errJson?.error?.message || ""; } catch (e) {}
+    throw new Error("APIエラー(" + res.status + "): " + (detail || "リクエストに失敗しました"));
+  }
+  const data = await res.json();
+  const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
+  const clean = text.replace(/```json|```/g, "").trim();
+  return extractJsonSubstring(clean);
+}
+
+async function callClaude(essay) {
+  const sys = `あなたは英作文の添削者です。日本人の英語学習者が書いた英作文を添削してください。
+以下のJSON形式のみで出力してください。説明文やコードフェンスは一切付けないでください。
+{
+  "correctedText": "自然な英語に修正した全文",
+  "rubric": {
+    "grammar": {"score": 1-5の整数, "comment": "日本語で短いコメント"},
+    "vocabulary": {"score": 1-5, "comment": "..."},
+    "structure": {"score": 1-5, "comment": "..."},
+    "content": {"score": 1-5, "comment": "..."},
+    "naturalness": {"score": 1-5, "comment": "..."}
+  },
+  "issues": ["主な指摘事項を日本語で箇条書き。3〜6個"],
+  "overallComment": "全体講評を日本語で2〜4文"
+}`;
+  const clean = await withRetry(() => callClaudeRaw(sys, essay, 1000));
+  return JSON.parse(clean);
+}
+
+async function generateDrillProblems(elements) {
+  const sys = `あなたは英検準一級・一級レベルの自由英作文を目指す日本人学習者のための和文英訳問題作成者です。
+以下の各行は「要素ID: 要素名(説明) — N問」の形式です。要素ごとに指定されたN問ぶん、それぞれ異なる状況設定の和文英訳問題を作成してください。
+日本語の例文は1〜2文程度で、その要素を使わないと訳しにくい状況設定にしてください。同じ要素内でも例文の内容は毎回変えてください。
+以下のJSON配列のみを出力してください。説明やコードフェンスは付けないでください。配列内の要素数は、指定された問数の合計と必ず一致させてください。
+[{"elementId": "要素のID", "japanese": "和文問題文", "modelAnswer": "模範解答の英文"}]`;
+  // 同じ要素が複数回渡されても、AIには「要素ごとにN問」という1行にまとめて依頼する
+  // (同一内容の行を並べて渡すと出力形式が崩れやすいため)
+  const counts = {};
+  const order = [];
+  elements.forEach(e => {
+    if (!counts[e.id]) { counts[e.id] = 0; order.push(e.id); }
+    counts[e.id]++;
+  });
+  const list = order.map(id => `${id}: ${ELEMENT_MAP[id].label}(${ELEMENT_MAP[id].desc}) — ${counts[id]}問`).join("\n");
+  const clean = await withRetry(() => callClaudeRaw(sys, list, 1400));
+  return JSON.parse(clean);
+}
+
+async function gradeDrillAnswers(items) {
+  const sys = `あなたは和文英訳問題の採点者です。日本人学習者の解答を採点してください。
+各設問には対象要素(targetElementId)が設定されていますが、実際に間違えた要素は対象要素と異なる場合もあるので、解答内容から正確に判定してください。
+選べる要素IDと説明は次の通りです:
+${CURRICULUM.map(e => `${e.id}: ${e.label}`).join("\n")}
+以下のJSON配列のみを出力してください。入力と同じ順番・同じ件数で返してください。説明やコードフェンスは付けないでください。
+[{"correct": true/false, "correctedText": "自然な模範解答(誤りがあれば修正した形)", "feedback": "日本語で短い一言フィードバック", "mistakeElementId": "間違えた要素のID。正解の場合はnull"}]`;
+  const payload = items.map((it, i) => ({
+    no: i + 1, targetElementId: it.elementId, japanese: it.japanese,
+    modelAnswer: it.modelAnswer, userAnswer: it.userAnswer,
+  }));
+  const clean = await withRetry(() => callClaudeRaw(sys, JSON.stringify(payload), 1500));
+  return JSON.parse(clean);
+}
+
+// ---------- 自由英作文モード(3日に1回) ----------
+const FREEWRITE_SOURCES = [
+  { key: "juntendo", label: "順天堂大学(医学部)形式", note: "医療・社会的テーマについて、資料や状況設定を踏まえて意見を述べる形式。150〜200語程度。" },
+  { key: "eiken-pre1", label: "英検準1級 英作文", note: "TOPICに対しPOINTS(観点)が3つ与えられ、賛成/反対や自分の意見を理由とともに述べる形式。120〜150語程度。" },
+  { key: "eiken-1", label: "英検1級 英作文", note: "抽象度の高い社会的トピックについて、複数の観点から論じる形式。200〜240語程度。" },
+];
+const FREEWRITE_CRITERIA = [
+  { key: "achievement", label: "①課題達成・論旨適合性", max: 10 },
+  { key: "logic", label: "②論理展開・一貫性", max: 7 },
+  { key: "grammar", label: "③文法・構文", max: 5 },
+  { key: "vocabulary", label: "④語彙・語法", max: 4 },
+  { key: "composition", label: "⑤構成・文章の洗練性", max: 4 },
+];
+function gateCap(achievementScore) {
+  if (achievementScore >= 9) return 30;
+  if (achievementScore >= 7) return 27;
+  if (achievementScore >= 5) return 22;
+  if (achievementScore >= 3) return 15;
+  if (achievementScore >= 1) return 8;
+  return 5;
+}
+
+async function generateFreeWriteTheme(source) {
+  const sys = `あなたは${source.label}の出題者です。${source.note}
+実際の出題傾向に忠実な、自由英作文のテーマを1問作成してください。
+以下のJSON形式のみを出力してください。説明やコードフェンスは付けないでください。
+{
+  "theme": "英語での設問文(POINTSがある形式ならPOINTSも含める)",
+  "instructionsJa": "日本語での条件説明(語数目安、構成の指示など)"
+}`;
+  const clean = await withRetry(() => callClaudeRaw(sys, `${source.label}のテーマを1つ作成してください。`, 700));
+  return JSON.parse(clean);
+}
+
+async function gradeFreeWrite(theme, essayText) {
+  const sys = `あなたは自由英作文の採点者です。次の30点ルーブリックに厳密に従って採点してください。
+
+① 課題達成・論旨適合性(10点): 設問に真正面から答えているか。主張が明確か。要求された内容を満たすか
+② 論理展開・一貫性(7点): 主張→理由→説明・具体例→結論が一貫しているか
+③ 文法・構文(5点): 文法的に正確で、文構造が明瞭か
+④ 語彙・語法(4点): 語彙選択・コロケーション・語法が適切か
+⑤ 構成・文章の洗練性(4点): パラグラフ構成、文の接続、自然さ、表現の成熟度
+
+①は0〜10の整数、②は0〜7、③は0〜5、④は0〜4、⑤は0〜4の整数で採点してください。
+
+さらに、解答中の文法的な誤りを個別に洗い出してください。各誤りについて、次の要素リストの中から最も近いelementIdを1つ選んでください(どれにも該当しない場合はnullにしてください):
+${CURRICULUM.map(e => `${e.id}: ${e.label}`).join("\n")}
+スペルミスや冠詞の単純な付け忘れなど、瑣末な誤りはminor:trueにしてください。文構造・時制・態・準動詞・関係詞・仮定法など、学習上重要な文法要素の誤りはminor:falseにしてください。
+
+以下のJSON形式のみを出力してください。説明やコードフェンスは付けないでください。
+{
+  "scores": {"achievement": 0-10, "logic": 0-7, "grammar": 0-5, "vocabulary": 0-4, "composition": 0-4},
+  "comments": {"achievement": "日本語で短いコメント", "logic": "...", "grammar": "...", "vocabulary": "...", "composition": "..."},
+  "overallComment": "全体講評を日本語で2〜4文",
+  "modelAnswer": "この設問に対する模範解答の英文",
+  "grammarMistakes": [{"elementId": "要素IDまたはnull", "description": "誤りの内容を日本語で一言", "minor": true/false}]
+}`;
+  const clean = await withRetry(() => callClaudeRaw(sys, `設問:\n${theme}\n\n解答:\n${essayText}`, 1400));
+  return JSON.parse(clean);
+}
+
+// ---------- weighted selection helpers ----------
+function weightedSample(pool, weightFn, n) {
+  // pool: array; weightFn(item)->number>0; returns n items (allows repeats if pool smaller)
+  const picks = [];
+  const avail = pool.slice();
+  while (picks.length < n && avail.length > 0) {
+    const keyed = avail.map(item => ({ item, key: -Math.log(Math.random() + 1e-9) / weightFn(item) }));
+    keyed.sort((a, b) => a.key - b.key);
+    picks.push(keyed[0].item);
+    avail.splice(avail.findIndex(x => x === keyed[0].item), 1);
+    if (avail.length === 0 && picks.length < n) avail.push(...pool);
+  }
+  return picks;
+}
+
+function ScoreDial({ label, score, comment }) {
+  const pct = (score / 5) * 100;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: "#4B4640" }}>
+        <span>{label}</span>
+        <span style={{ color: "#B23A2E", fontWeight: 600 }}>{score}/5</span>
+      </div>
+      <div style={{ height: 6, background: "#E7E0CE", borderRadius: 3, marginTop: 4, overflow: "hidden" }}>
+        <div style={{ width: pct + "%", height: "100%", background: "linear-gradient(90deg,#B23A2E,#C9A227)" }} />
+      </div>
+      {comment && <div style={{ fontSize: 12.5, color: "#5A5347", marginTop: 4, lineHeight: 1.5 }}>{comment}</div>}
+    </div>
+  );
+}
+
+function Manuscript({ original, corrected }) {
+  const ops = diffTokens(tokenize(original), tokenize(corrected));
+  return (
+    <div style={{ fontFamily: "'Newsreader', serif", fontSize: 17, lineHeight: 1.9, color: "#2A2620", whiteSpace: "pre-wrap" }}>
+      {ops.map((op, idx) => {
+        if (op.t === "eq") return <span key={idx}>{op.v}</span>;
+        if (op.t === "del") return (
+          <span key={idx} style={{ color: "#B23A2E", textDecoration: "line-through", textDecorationThickness: "1.5px", opacity: 0.75 }}>{op.v}</span>
+        );
+        return (
+          <span key={idx} style={{ color: "#2F5D50", borderBottom: "1.5px solid #2F5D50", fontStyle: "italic" }}>{op.v}</span>
+        );
+      })}
+    </div>
+  );
+}
+
+function CriteriaBar({ label, score, max, comment }) {
+  const pct = (score / max) * 100;
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: "#4B4640" }}>
+        <span>{label}</span>
+        <span style={{ color: "#B23A2E", fontWeight: 600 }}>{score}/{max}</span>
+      </div>
+      <div style={{ height: 6, background: "#E7E0CE", borderRadius: 3, marginTop: 4, overflow: "hidden" }}>
+        <div style={{ width: pct + "%", height: "100%", background: "linear-gradient(90deg,#B23A2E,#C9A227)" }} />
+      </div>
+      {comment && <div style={{ fontSize: 12.5, color: "#5A5347", marginTop: 4, lineHeight: 1.5 }}>{comment}</div>}
+    </div>
+  );
+}
+
+const ROUND_LABEL = {
+  daily: "今日の5問", remedial: "定着問題(前回の間違い対策)",
+  weekly: "週次演習(10問)", weeklyRemedial: "定着問題(週次演習の間違い対策)",
+};
+
+function DrillSession({ session, onAnswerChange, onSubmit, onFinish, loading }) {
+  const allAnswered = session.problems.every(p => (p.userAnswer || "").trim().length > 0);
+  return (
+    <div>
+      <div style={{ ...cardStyle, marginBottom: 12 }}>
+        <div style={labelStyle}>{ROUND_LABEL[session.round]}</div>
+        <div style={{ fontSize: 12, color: "#8A8478" }}>{session.problems.length}問 / 対象要素: {[...new Set(session.problems.map(p => ELEMENT_MAP[p.elementId]?.label))].join("・")}</div>
+        {session.usedFallback && <div style={{ fontSize: 11, color: "#C9A227", marginTop: 6 }}>※ AI生成が使えなかったため予備問題セットです</div>}
+      </div>
+      {session.problems.map((p, i) => (
+        <div key={i} style={{ ...cardStyle, marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: "#8A8478", marginBottom: 6, fontFamily: "'IBM Plex Mono', monospace" }}>
+            Q{i + 1} ・ {ELEMENT_MAP[p.elementId]?.label}
+          </div>
+          <div style={{ fontFamily: "'Newsreader', serif", fontSize: 17, color: "#2A2620", marginBottom: 10, lineHeight: 1.7 }}>{p.japanese}</div>
+          {session.stage === "answering" ? (
+            <textarea
+              value={p.userAnswer || ""}
+              onChange={(e) => onAnswerChange(i, e.target.value)}
+              placeholder="英訳を入力"
+              style={{ width: "100%", minHeight: 60, fontFamily: "'Newsreader', serif", fontSize: 15.5, border: "1px solid #E7E0CE", borderRadius: 6, padding: 8, boxSizing: "border-box" }}
+            />
+          ) : (
+            <div>
+              <div style={{ fontSize: 14.5, color: p.correct ? "#2F5D50" : "#B23A2E", fontFamily: "'IBM Plex Mono', monospace", marginBottom: 4 }}>
+                {p.correct ? "◯ 正解" : "✕ 要修正"}
+              </div>
+              <div style={{ fontSize: 14, color: "#3A3529", marginBottom: 4 }}><b>あなたの解答:</b> {p.userAnswer}</div>
+              <div style={{ fontSize: 14, color: "#2F5D50", marginBottom: 4 }}><b>模範解答:</b> {p.correctedText}</div>
+              <div style={{ fontSize: 12.5, color: "#5A5347", fontStyle: "italic" }}>{p.feedback}</div>
+            </div>
+          )}
+        </div>
+      ))}
+      {session.stage === "answering" ? (
+        <button onClick={onSubmit} disabled={loading || !allAnswered} style={primaryBtn(loading || !allAnswered)}>
+          {loading ? "採点中..." : "採点する"}
+        </button>
+      ) : (
+        <button onClick={onFinish} style={primaryBtn(false)}>完了</button>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  const [view, setView] = useState("write"); // write | drill | freewrite | history | settings
+  const [apiKeyPresent, setApiKeyPresent] = useState(!!getApiKey());
+  const [apiKeyInput, setApiKeyInput] = useState(getApiKey());
+  const [apiKeySaved, setApiKeySaved] = useState(false);
+  const [essay, setEssay] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+  const [editedText, setEditedText] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [myNote, setMyNote] = useState("");
+  const [history, setHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const taRef = useRef(null);
+
+  // drill state
+  const [drillState, setDrillState] = useState({ progressPointer: 0, elementStats: {} });
+  const [drillLoading, setDrillLoading] = useState(false);
+  const [drillError, setDrillError] = useState("");
+  const [drillWarning, setDrillWarning] = useState("");
+  const [showExport, setShowExport] = useState(false);
+  const [session, setSession] = useState(null);
+  const [drillReady, setDrillReady] = useState(false);
+
+  // freewrite state
+  const [freeWriteState, setFreeWriteState] = useState({ lastTs: null, usedThemes: [] });
+  const [freeWriteReady, setFreeWriteReady] = useState(false);
+  const [freeWriteLoading, setFreeWriteLoading] = useState(false);
+  const [freeWriteError, setFreeWriteError] = useState("");
+  const [freeWriteSession, setFreeWriteSession] = useState(null); // {source, theme, instructionsJa, essayText, stage, result}
+
+  useEffect(() => {
+    if (view === "history") loadHistory();
+    if (view === "drill" && !drillReady) loadDrillState();
+    if (view === "freewrite" && !freeWriteReady) loadFreeWriteState();
+  }, [view]);
+
+  async function loadHistory() {
+    setHistoryLoading(true);
+    try {
+      const list = await window.storage.list("essay:", false);
+      const keys = (list && list.keys) || [];
+      const items = [];
+      for (const k of keys) {
+        try {
+          const r = await window.storage.get(k, false);
+          if (r) items.push(JSON.parse(r.value));
+        } catch (e) {}
+      }
+      items.sort((a, b) => b.ts - a.ts);
+      setHistory(items);
+    } catch (e) {
+      setError("履歴の読み込みに失敗しました。");
+    }
+    setHistoryLoading(false);
+  }
+
+  async function loadDrillState() {
+    try {
+      const r = await window.storage.get("drill-state", false);
+      if (r) {
+        const parsed = JSON.parse(r.value);
+        if (parsed.curriculumVersion !== CURRICULUM_VERSION) {
+          // カリキュラムの形式が変わったため進捗をリセット
+          const reset = { progressPointer: 0, elementStats: {}, curriculumVersion: CURRICULUM_VERSION };
+          setDrillState(reset);
+          window.storage.set("drill-state", JSON.stringify(reset), false).catch(() => {});
+        } else {
+          setDrillState(parsed);
+        }
+      } else {
+        setDrillState({ progressPointer: 0, elementStats: {}, curriculumVersion: CURRICULUM_VERSION });
+      }
+    } catch (e) { console.error("loadDrillState failed", e); }
+    setDrillReady(true);
+  }
+
+  async function saveDrillState(next) {
+    const withVer = { ...next, curriculumVersion: CURRICULUM_VERSION };
+    setDrillState(withVer);
+    try {
+      await window.storage.set("drill-state", JSON.stringify(withVer), false);
+      setDrillWarning("");
+    } catch (e) {
+      console.error("saveDrillState failed, retrying once", e);
+      try {
+        await window.storage.set("drill-state", JSON.stringify(withVer), false);
+        setDrillWarning("");
+      } catch (e2) {
+        console.error("saveDrillState retry failed", e2);
+        const msg = (e2 && (e2.message || e2.toString())) || "不明なエラー";
+        setDrillWarning("進捗の保存が一時的にできていません(学習はこのまま続けられます): " + msg);
+      }
+    }
+  }
+
+  async function appendDrillLog(entries) {
+    try {
+      const r = await window.storage.get("drill-log", false).catch(() => null);
+      let log = [];
+      try { if (r) log = JSON.parse(r.value); } catch (e) {}
+      log = [...log, ...entries];
+      if (log.length > 400) log = log.slice(log.length - 400);
+      await window.storage.set("drill-log", JSON.stringify(log), false);
+    } catch (e) { /* best effort */ }
+  }
+
+  async function loadFreeWriteState() {
+    try {
+      const r = await window.storage.get("freewrite-state", false);
+      if (r) setFreeWriteState(JSON.parse(r.value));
+    } catch (e) { /* no state yet */ }
+    setFreeWriteReady(true);
+  }
+
+  async function saveFreeWriteState(next) {
+    setFreeWriteState(next);
+    try {
+      await window.storage.set("freewrite-state", JSON.stringify(next), false);
+    } catch (e) {
+      console.error("saveFreeWriteState failed", e);
+      // 保存だけ静かに失敗させ、その場の学習は継続させる
+    }
+  }
+
+  async function startFreeWrite() {
+    setFreeWriteError("");
+    setFreeWriteLoading(true);
+    try {
+      const source = FREEWRITE_SOURCES[Math.floor(Math.random() * FREEWRITE_SOURCES.length)];
+      const t = await generateFreeWriteTheme(source);
+      setFreeWriteSession({ source, theme: t.theme, instructionsJa: t.instructionsJa, essayText: "", stage: "writing", result: null });
+    } catch (e) {
+      setFreeWriteError("テーマの生成に失敗しました。もう一度お試しください。");
+    }
+    setFreeWriteLoading(false);
+  }
+
+  function recordFreeWriteMistakes(elementIds) {
+    if (elementIds.length === 0) return;
+    const stats = { ...drillState.elementStats };
+    elementIds.forEach(id => {
+      const cur = stats[id] || { attempts: 0, mistakes: 0 };
+      stats[id] = { attempts: cur.attempts + 1, mistakes: cur.mistakes + 1 };
+    });
+    saveDrillState({ ...drillState, elementStats: stats });
+  }
+
+  async function startFreeWriteRemedial(elementIds) {
+    const elements = [];
+    elementIds.forEach(id => { if (ELEMENT_MAP[id]) { elements.push(ELEMENT_MAP[id]); elements.push(ELEMENT_MAP[id]); } }); // 2問ずつ
+    await startRound("remedial", elements.slice(0, 10));
+    setView("drill");
+  }
+
+  async function submitFreeWrite() {
+    setFreeWriteLoading(true);
+    setFreeWriteError("");
+    try {
+      const g = await gradeFreeWrite(freeWriteSession.theme, freeWriteSession.essayText);
+      const cap = gateCap(g.scores.achievement);
+      const rawTotal = FREEWRITE_CRITERIA.reduce((s, c) => s + g.scores[c.key], 0);
+      const finalTotal = Math.min(rawTotal, cap);
+      const mistakeElementIds = [...new Set((g.grammarMistakes || [])
+        .filter(m => m.elementId && !m.minor && ELEMENT_MAP[m.elementId])
+        .map(m => m.elementId))];
+      const result = { ...g, rawTotal, cap, finalTotal, mistakeElementIds };
+      setFreeWriteSession({ ...freeWriteSession, stage: "result", result });
+      recordFreeWriteMistakes(mistakeElementIds);
+      const nextState = {
+        lastTs: Date.now(),
+        usedThemes: [...freeWriteState.usedThemes, { ts: Date.now(), theme: freeWriteSession.theme, source: freeWriteSession.source.key, finalTotal }].slice(-50),
+      };
+      saveFreeWriteState(nextState);
+      try {
+        await window.storage.set("freewrite:" + Date.now(), JSON.stringify({
+          ts: Date.now(), source: freeWriteSession.source.label, theme: freeWriteSession.theme,
+          essayText: freeWriteSession.essayText, finalTotal, rawTotal, mistakeElementIds,
+        }), false);
+      } catch (e) { /* best effort */ }
+    } catch (e) {
+      setFreeWriteError("採点に失敗しました。もう一度お試しください。");
+    }
+    setFreeWriteLoading(false);
+  }
+
+  function pickDailyElements() {
+    const n = CURRICULUM.length;
+    const cycleDone = drillState.progressPointer >= n;
+    if (!cycleDone) {
+      // 1周目: 30日程度でカリキュラムを一周するペースで、同じ講を数日かけて繰り返す
+      const idx = Math.floor(drillState.progressPointer) % n;
+      const el = CURRICULUM[idx];
+      const elements = [el, el, el, el, el];
+      const increment = n / DAYS_TO_COMPLETE_CYCLE;
+      return { elements, increment };
+    }
+    // 1周終了後はランダム出題
+    const elements = [];
+    for (let i = 0; i < 5; i++) elements.push(CURRICULUM[Math.floor(Math.random() * n)]);
+    return { elements, increment: 0 };
+  }
+
+  function pickWeeklyElements() {
+    const attemptedIds = Object.keys(drillState.elementStats);
+    const pool = attemptedIds.length > 0 ? attemptedIds.map(id => ELEMENT_MAP[id]).filter(Boolean) : CURRICULUM.slice(0, Math.max(1, drillState.progressPointer));
+    return weightedSample(pool, e => (drillState.elementStats[e.id]?.mistakes || 0) + 1, 10);
+  }
+
+  async function startRound(round, elements) {
+    setDrillError("");
+    setDrillWarning("");
+    setDrillLoading(true);
+    try {
+      const probs = await generateDrillProblems(elements);
+      if (!Array.isArray(probs) || probs.length !== elements.length) {
+        throw new Error("problem count mismatch: expected " + elements.length + ", got " + (probs && probs.length));
+      }
+      const problems = probs.map(p => ({ ...p, userAnswer: "" }));
+      setSession({ round, stage: "answering", problems, usedFallback: false });
+    } catch (e) {
+      console.error("generateDrillProblems failed, using fallback bank", e);
+      const problems = getFallbackProblems(elements).map(p => ({ ...p, userAnswer: "" }));
+      setSession({ round, stage: "answering", problems, usedFallback: true });
+      setDrillWarning("AIによる問題生成が一時的にできなかったため、予備の問題セットを表示しています。");
+    }
+    setDrillLoading(false);
+  }
+
+  async function startDaily() {
+    const { elements, increment } = pickDailyElements();
+    await startRound("daily", elements);
+    if (increment > 0) {
+      const raw = drillState.progressPointer + increment;
+      const next = { ...drillState, progressPointer: Math.min(raw, CURRICULUM.length) };
+      saveDrillState(next);
+    }
+  }
+
+  async function startWeekly() {
+    await startRound("weekly", pickWeeklyElements());
+  }
+
+  function updateAnswer(i, val) {
+    setSession(s => {
+      const problems = s.problems.slice();
+      problems[i] = { ...problems[i], userAnswer: val };
+      return { ...s, problems };
+    });
+  }
+
+  async function submitSession() {
+    setDrillLoading(true);
+    setDrillError("");
+    try {
+      const graded = await gradeDrillAnswers(session.problems);
+      const problems = session.problems.map((p, i) => ({
+        ...p,
+        correct: graded[i].correct,
+        correctedText: graded[i].correctedText,
+        feedback: graded[i].feedback,
+        mistakeElementId: graded[i].mistakeElementId,
+      }));
+      // update stats
+      const stats = { ...drillState.elementStats };
+      problems.forEach(p => {
+        const target = p.elementId;
+        stats[target] = stats[target] || { attempts: 0, mistakes: 0 };
+        stats[target] = { attempts: stats[target].attempts + 1, mistakes: stats[target].mistakes + (p.correct ? 0 : 1) };
+        if (!p.correct && p.mistakeElementId && p.mistakeElementId !== target && ELEMENT_MAP[p.mistakeElementId]) {
+          const m = p.mistakeElementId;
+          stats[m] = stats[m] || { attempts: 0, mistakes: 0 };
+          stats[m] = { ...stats[m], mistakes: stats[m].mistakes + 1 };
+        }
+      });
+      saveDrillState({ ...drillState, elementStats: stats });
+      appendDrillLog(problems.map(p => ({ ts: Date.now(), round: session.round, elementId: p.elementId, japanese: p.japanese, userAnswer: p.userAnswer, correct: p.correct, mistakeElementId: p.mistakeElementId })));
+      setSession({ ...session, stage: "result", problems });
+    } catch (e) {
+      setDrillError("採点に失敗しました。もう一度お試しください。");
+    }
+    setDrillLoading(false);
+  }
+
+  async function finishSession() {
+    const wrong = session.problems.filter(p => !p.correct);
+    const isRemedialRound = session.round === "remedial" || session.round === "weeklyRemedial";
+    if (wrong.length > 0 && !isRemedialRound) {
+      const ids = [...new Set(wrong.map(p => p.mistakeElementId && ELEMENT_MAP[p.mistakeElementId] ? p.mistakeElementId : p.elementId))];
+      const remedialElements = [];
+      ids.forEach(id => { remedialElements.push(ELEMENT_MAP[id]); remedialElements.push(ELEMENT_MAP[id]); }); // 2問ずつ
+      const nextRound = session.round === "weekly" ? "weeklyRemedial" : "remedial";
+      await startRound(nextRound, remedialElements.slice(0, 10));
+    } else {
+      setSession(null);
+    }
+  }
+
+  async function handleSubmit() {
+    if (!essay.trim()) return;
+    setLoading(true);
+    setError("");
+    try {
+      const r = await callClaude(essay.trim());
+      setResult(r);
+      setEditedText(r.correctedText);
+      setMyNote("");
+      setEditing(false);
+      setView("result");
+    } catch (e) {
+      setError("添削中にエラーが発生しました。もう一度お試しください。");
+    }
+    setLoading(false);
+  }
+
+  async function handleSave() {
+    if (!result) return;
+    const entry = {
+      ts: Date.now(), original: essay.trim(), correctedText: editedText,
+      rubric: result.rubric, issues: result.issues, overallComment: result.overallComment, myNote,
+    };
+    try {
+      await window.storage.set("essay:" + entry.ts, JSON.stringify(entry), false);
+      setEssay(""); setResult(null); setView("history");
+    } catch (e) { setError("保存に失敗しました。"); }
+  }
+
+  const avgScore = result ? (RUBRIC_KEYS.reduce((s, k) => s + result.rubric[k.key].score, 0) / RUBRIC_KEYS.length).toFixed(1) : null;
+  const masteryList = Object.keys(drillState.elementStats)
+    .map(id => ({ id, label: ELEMENT_MAP[id]?.label, ...drillState.elementStats[id] }))
+    .filter(x => x.label)
+    .sort((a, b) => (b.mistakes / b.attempts) - (a.mistakes / a.attempts));
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#10161A", fontFamily: "'IBM Plex Mono', monospace", padding: "24px 16px 60px" }}>
+      <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Newsreader:ital@0;1&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+
+      <div style={{ maxWidth: 640, margin: "0 auto" }}>
+        <header style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 20 }}>
+          <div>
+            <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 700, fontSize: 26, color: "#FAF6EC", letterSpacing: "-0.01em" }}>Red Pen</div>
+            <div style={{ fontSize: 11, color: "#8A8478", marginTop: 2 }}>英作文添削ノート</div>
+          </div>
+          <nav style={{ display: "flex", gap: 14, fontSize: 12 }}>
+            <button onClick={() => setView("write")} style={navBtn(view === "write")}>書く</button>
+            <button onClick={() => setView("drill")} style={navBtn(view === "drill")}>特訓</button>
+            <button onClick={() => setView("freewrite")} style={navBtn(view === "freewrite")}>自由作文</button>
+            <button onClick={() => setView("history")} style={navBtn(view === "history")}>履歴</button>
+            <button onClick={() => setView("settings")} style={navBtn(view === "settings")}>設定{!apiKeyPresent && " ⚠"}</button>
+          </nav>
+        </header>
+
+        {error && <div style={errBox}>{error}</div>}
+
+        {view === "write" && (
+          <div style={cardStyle}>
+            <div style={labelStyle}>今日の英作文</div>
+            <textarea
+              ref={taRef} value={essay} onChange={(e) => setEssay(e.target.value)}
+              placeholder="ここに英作文を書いてください..."
+              style={{ width: "100%", minHeight: 220, border: "none", outline: "none", resize: "vertical", fontFamily: "'Newsreader', serif", fontSize: 17, lineHeight: 1.8, color: "#2A2620", background: "transparent", boxSizing: "border-box" }}
+            />
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+              <button onClick={handleSubmit} disabled={loading || !essay.trim()} style={primaryBtn(loading || !essay.trim())}>
+                {loading ? "添削中..." : "添削してもらう"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {view === "result" && result && (
+          <div>
+            <div style={cardStyle}>
+              <div style={labelStyle}>添削原稿（見え消し表示）</div>
+              <Manuscript original={essay} corrected={editedText} />
+            </div>
+            <div style={{ ...cardStyle, marginTop: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={labelStyle}>修正後の全文{editing ? "（編集中）" : ""}</div>
+                <button onClick={() => setEditing(v => !v)} style={ghostBtn}>{editing ? "完了" : "手動で修正"}</button>
+              </div>
+              {editing ? (
+                <textarea value={editedText} onChange={(e) => setEditedText(e.target.value)} style={{ width: "100%", minHeight: 140, fontFamily: "'Newsreader', serif", fontSize: 16, lineHeight: 1.8, color: "#2A2620", border: "1px solid #E7E0CE", borderRadius: 6, padding: 10, boxSizing: "border-box" }} />
+              ) : (
+                <div style={{ fontFamily: "'Newsreader', serif", fontSize: 16, lineHeight: 1.8, color: "#2A2620", whiteSpace: "pre-wrap" }}>{editedText}</div>
+              )}
+            </div>
+            <div style={{ ...cardStyle, marginTop: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+                <div style={labelStyle}>採点基準（観点別）</div>
+                <div style={{ fontFamily: "'Fraunces', serif", fontSize: 22, fontWeight: 700, color: "#C9A227" }}>{avgScore}<span style={{ fontSize: 12, color: "#8A8478" }}> /5</span></div>
+              </div>
+              {RUBRIC_KEYS.map(k => <ScoreDial key={k.key} label={k.label} score={result.rubric[k.key].score} comment={result.rubric[k.key].comment} />)}
+            </div>
+            <div style={{ ...cardStyle, marginTop: 14 }}>
+              <div style={labelStyle}>指摘事項</div>
+              <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13.5, color: "#3A3529", lineHeight: 1.9 }}>
+                {result.issues.map((it, i) => <li key={i}>{it}</li>)}
+              </ul>
+              <div style={{ marginTop: 10, fontSize: 13.5, color: "#3A3529", lineHeight: 1.8, fontStyle: "italic" }}>{result.overallComment}</div>
+            </div>
+            <div style={{ ...cardStyle, marginTop: 14 }}>
+              <div style={labelStyle}>自分のメモ</div>
+              <textarea value={myNote} onChange={(e) => setMyNote(e.target.value)} placeholder="気づいたこと、次に意識したいことなど" style={{ width: "100%", minHeight: 70, fontFamily: "'Newsreader', serif", fontSize: 15, color: "#2A2620", border: "1px solid #E7E0CE", borderRadius: 6, padding: 10, boxSizing: "border-box" }} />
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+              <button onClick={() => setView("write")} style={ghostBtnWide}>書き直す</button>
+              <button onClick={handleSave} style={primaryBtn(false)}>履歴に保存</button>
+            </div>
+          </div>
+        )}
+
+        {view === "drill" && (
+          <div>
+            {drillError && <div style={errBox}>{drillError}</div>}
+            {drillWarning && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, fontSize: 11.5, color: "#8A8478", marginBottom: 14, lineHeight: 1.6 }}>
+                <span>⚠ {drillWarning}</span>
+                <button onClick={() => saveDrillState(drillState)} style={{ ...ghostBtn, whiteSpace: "nowrap" }}>今すぐ再送信</button>
+              </div>
+            )}
+            {!session && (
+              <div>
+                <div style={{ ...cardStyle, marginBottom: 12 }}>
+                  <div style={labelStyle}>進捗</div>
+                  {drillState.progressPointer >= CURRICULUM.length ? (
+                    <div style={{ fontSize: 13, color: "#3A3529" }}>カリキュラム1周 完了 ・ 以降はランダム出題です</div>
+                  ) : (
+                    <div style={{ fontSize: 13, color: "#3A3529" }}>
+                      約{DAYS_TO_COMPLETE_CYCLE}日で1周予定 ・ 現在: {ELEMENT_MAP[CURRICULUM[Math.floor(drillState.progressPointer) % CURRICULUM.length].id].label}
+                    </div>
+                  )}
+                  <div style={{ height: 6, background: "#E7E0CE", borderRadius: 3, marginTop: 8, overflow: "hidden" }}>
+                    <div style={{ width: (Math.min(drillState.progressPointer, CURRICULUM.length) / CURRICULUM.length * 100) + "%", height: "100%", background: "linear-gradient(90deg,#B23A2E,#C9A227)" }} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                  <button onClick={startDaily} disabled={drillLoading} style={primaryBtn(drillLoading)}>{drillLoading ? "準備中..." : "今日の5問"}</button>
+                  <button onClick={startWeekly} disabled={drillLoading || Object.keys(drillState.elementStats).length === 0} style={ghostBtnWide}>週次演習(10問)</button>
+                </div>
+                {masteryList.length > 0 && (
+                  <div style={cardStyle}>
+                    <div style={labelStyle}>要素別 定着度(誤答率が高い順)</div>
+                    {masteryList.map(m => (
+                      <div key={m.id} style={{ marginBottom: 10 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "#4B4640" }}>
+                          <span>{m.label}</span>
+                          <span style={{ color: "#8A8478" }}>{m.attempts - m.mistakes}/{m.attempts} 正解</span>
+                        </div>
+                        <div style={{ height: 5, background: "#E7E0CE", borderRadius: 3, marginTop: 3, overflow: "hidden" }}>
+                          <div style={{ width: (100 - (m.mistakes / m.attempts * 100)) + "%", height: "100%", background: "#2F5D50" }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div style={{ marginTop: 14 }}>
+                  <button onClick={() => setShowExport(v => !v)} style={ghostBtnWide}>{showExport ? "進捗データを隠す" : "進捗データをバックアップ用に表示"}</button>
+                  {showExport && (
+                    <textarea
+                      readOnly
+                      value={JSON.stringify({ progressPointer: drillState.progressPointer, elementStats: drillState.elementStats }, null, 2)}
+                      onFocus={(e) => e.target.select()}
+                      style={{ width: "100%", minHeight: 140, marginTop: 8, fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, color: "#3A3529", border: "1px solid #E7E0CE", borderRadius: 6, padding: 8, boxSizing: "border-box", background: "#FAF6EC" }}
+                    />
+                  )}
+                </div>
+              </div>
+            )}
+            {session && (
+              <DrillSession session={session} onAnswerChange={updateAnswer} onSubmit={submitSession} onFinish={finishSession} loading={drillLoading} />
+            )}
+          </div>
+        )}
+
+        {view === "freewrite" && (() => {
+          const daysSince = freeWriteState.lastTs ? (Date.now() - freeWriteState.lastTs) / 86400000 : Infinity;
+          const dueIn = Math.max(0, Math.ceil(3 - daysSince));
+          const isDue = daysSince >= 3;
+          return (
+            <div>
+              {freeWriteError && <div style={errBox}>{freeWriteError}</div>}
+              {!freeWriteSession && (
+                <div>
+                  <div style={{ ...cardStyle, marginBottom: 14 }}>
+                    <div style={labelStyle}>自由英作文モード(3日に1回目安)</div>
+                    {isDue ? (
+                      <div style={{ fontSize: 13.5, color: "#B23A2E", fontWeight: 600 }}>🔔 今日は自由英作文の日です</div>
+                    ) : (
+                      <div style={{ fontSize: 13, color: "#8A8478" }}>次の目安まであと{dueIn}日(いつでも挑戦できます)</div>
+                    )}
+                    <div style={{ fontSize: 12, color: "#8A8478", marginTop: 8 }}>順天堂大学・英検準1級・英検1級形式のテーマからランダムに出題し、30点ルーブリックで採点します。</div>
+                    <div style={{ marginTop: 12 }}>
+                      <button onClick={startFreeWrite} disabled={freeWriteLoading} style={primaryBtn(freeWriteLoading)}>
+                        {freeWriteLoading ? "準備中..." : "テーマを見る"}
+                      </button>
+                    </div>
+                  </div>
+                  {freeWriteState.usedThemes.length > 0 && (
+                    <div style={cardStyle}>
+                      <div style={labelStyle}>直近の記録</div>
+                      {freeWriteState.usedThemes.slice(-5).reverse().map((t, i) => (
+                        <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "#4B4640", marginBottom: 6 }}>
+                          <span>{new Date(t.ts).toLocaleDateString("ja-JP")}</span>
+                          <span style={{ color: "#C9A227", fontWeight: 600 }}>{t.finalTotal}/30</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {freeWriteSession && freeWriteSession.stage === "writing" && (
+                <div>
+                  <div style={{ ...cardStyle, marginBottom: 12 }}>
+                    <div style={labelStyle}>{freeWriteSession.source.label}</div>
+                    <div style={{ fontFamily: "'Newsreader', serif", fontSize: 16.5, color: "#2A2620", lineHeight: 1.8, whiteSpace: "pre-wrap", marginBottom: 8 }}>{freeWriteSession.theme}</div>
+                    <div style={{ fontSize: 12.5, color: "#8A8478", fontStyle: "italic" }}>{freeWriteSession.instructionsJa}</div>
+                  </div>
+                  <div style={cardStyle}>
+                    <div style={labelStyle}>解答</div>
+                    <textarea
+                      value={freeWriteSession.essayText}
+                      onChange={(e) => setFreeWriteSession({ ...freeWriteSession, essayText: e.target.value })}
+                      placeholder="ここに英作文を書いてください..."
+                      style={{ width: "100%", minHeight: 220, fontFamily: "'Newsreader', serif", fontSize: 16.5, lineHeight: 1.8, color: "#2A2620", border: "1px solid #E7E0CE", borderRadius: 6, padding: 10, boxSizing: "border-box" }}
+                    />
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 8 }}>
+                      <button onClick={submitFreeWrite} disabled={freeWriteLoading || !freeWriteSession.essayText.trim()} style={primaryBtn(freeWriteLoading || !freeWriteSession.essayText.trim())}>
+                        {freeWriteLoading ? "採点中..." : "採点する"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {freeWriteSession && freeWriteSession.stage === "result" && (
+                <div>
+                  <div style={{ ...cardStyle, marginBottom: 12 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                      <div style={labelStyle}>総合得点</div>
+                      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 28, fontWeight: 700, color: "#C9A227" }}>
+                        {freeWriteSession.result.finalTotal}<span style={{ fontSize: 13, color: "#8A8478" }}> /30</span>
+                      </div>
+                    </div>
+                    {freeWriteSession.result.finalTotal < freeWriteSession.result.rawTotal && (
+                      <div style={{ fontSize: 12.5, color: "#B23A2E", marginTop: 6 }}>
+                        課題達成が{freeWriteSession.result.scores.achievement}点のため、上限{freeWriteSession.result.cap}点が適用されました(素点{freeWriteSession.result.rawTotal}点)
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ ...cardStyle, marginBottom: 12 }}>
+                    <div style={labelStyle}>項目別スコア</div>
+                    {FREEWRITE_CRITERIA.map(c => (
+                      <CriteriaBar key={c.key} label={c.label} score={freeWriteSession.result.scores[c.key]} max={c.max} comment={freeWriteSession.result.comments[c.key]} />
+                    ))}
+                  </div>
+                  <div style={{ ...cardStyle, marginBottom: 12 }}>
+                    <div style={labelStyle}>総評</div>
+                    <div style={{ fontSize: 13.5, color: "#3A3529", lineHeight: 1.8 }}>{freeWriteSession.result.overallComment}</div>
+                  </div>
+                  <div style={{ ...cardStyle, marginBottom: 12 }}>
+                    <div style={labelStyle}>模範解答</div>
+                    <div style={{ fontFamily: "'Newsreader', serif", fontSize: 15.5, color: "#2A2620", lineHeight: 1.8, whiteSpace: "pre-wrap" }}>{freeWriteSession.result.modelAnswer}</div>
+                  </div>
+                  {(freeWriteSession.result.grammarMistakes || []).length > 0 && (
+                    <div style={{ ...cardStyle, marginBottom: 12 }}>
+                      <div style={labelStyle}>文法的な誤り</div>
+                      <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, color: "#3A3529", lineHeight: 1.8 }}>
+                        {freeWriteSession.result.grammarMistakes.map((m, i) => (
+                          <li key={i}>{m.description}{m.elementId && ELEMENT_MAP[m.elementId] ? `(${ELEMENT_MAP[m.elementId].label})` : ""}{m.minor ? " ※軽微" : ""}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {freeWriteSession.result.mistakeElementIds.length > 0 && (
+                    <div style={{ ...cardStyle, marginBottom: 12 }}>
+                      <div style={labelStyle}>この誤りは記憶されました</div>
+                      <div style={{ fontSize: 12.5, color: "#8A8478", marginBottom: 10 }}>
+                        {freeWriteSession.result.mistakeElementIds.map(id => ELEMENT_MAP[id].label).join("・")} は今後の演習(今日の5問・週次演習)で重点的に出題されます。
+                      </div>
+                      <button onClick={() => startFreeWriteRemedial(freeWriteSession.result.mistakeElementIds)} disabled={drillLoading} style={ghostBtnWide}>
+                        {drillLoading ? "準備中..." : "今すぐ和文英訳で復習する"}
+                      </button>
+                    </div>
+                  )}
+                  <button onClick={() => setFreeWriteSession(null)} style={primaryBtn(false)}>完了</button>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {view === "history" && (
+          <div>
+            {historyLoading && <div style={{ color: "#8A8478", fontSize: 13 }}>読み込み中...</div>}
+            {!historyLoading && history.length === 0 && (
+              <div style={{ color: "#8A8478", fontSize: 13, textAlign: "center", padding: "40px 0" }}>まだ提出はありません。「書く」から始めましょう。</div>
+            )}
+            {history.map((h) => {
+              const avg = (RUBRIC_KEYS.reduce((s, k) => s + h.rubric[k.key].score, 0) / RUBRIC_KEYS.length).toFixed(1);
+              return (
+                <div key={h.ts} style={{ ...cardStyle, marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#8A8478" }}>
+                    <span>{new Date(h.ts).toLocaleString("ja-JP")}</span>
+                    <span style={{ color: "#C9A227", fontWeight: 600 }}>{avg}/5</span>
+                  </div>
+                  <div style={{ fontFamily: "'Newsreader', serif", fontSize: 14.5, color: "#3A3529", marginTop: 6, lineHeight: 1.7 }}>
+                    {h.original.slice(0, 90)}{h.original.length > 90 ? "…" : ""}
+                  </div>
+                  {h.myNote && <div style={{ fontSize: 12, color: "#8A8478", marginTop: 6, fontStyle: "italic" }}>メモ: {h.myNote}</div>}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {view === "settings" && (
+          <div>
+            <div style={cardStyle}>
+              <div style={labelStyle}>Anthropic APIキー</div>
+              <div style={{ fontSize: 12.5, color: "#5A5347", lineHeight: 1.7, marginBottom: 12 }}>
+                console.anthropic.com で発行した「sk-ant-...」から始まるキーを貼り付けてください。この端末のブラウザ内にのみ保存され、外部には送信されません(AI呼び出し時にAnthropicへ直接送信されるのみです)。
+              </div>
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(e) => { setApiKeyInput(e.target.value); setApiKeySaved(false); }}
+                placeholder="sk-ant-..."
+                style={{ width: "100%", fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, color: "#2A2620", border: "1px solid #E7E0CE", borderRadius: 6, padding: 10, boxSizing: "border-box" }}
+              />
+              <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+                <button
+                  onClick={() => { setApiKey(apiKeyInput.trim()); setApiKeyPresent(!!apiKeyInput.trim()); setApiKeySaved(true); }}
+                  style={primaryBtn(false)}
+                >
+                  保存
+                </button>
+                <button
+                  onClick={() => { setApiKey(""); setApiKeyInput(""); setApiKeyPresent(false); setApiKeySaved(false); }}
+                  style={ghostBtn}
+                >
+                  削除
+                </button>
+              </div>
+              {apiKeySaved && <div style={{ fontSize: 12, color: "#2F5D50", marginTop: 8 }}>保存しました。</div>}
+              {!apiKeyPresent && <div style={{ fontSize: 12, color: "#B23A2E", marginTop: 8 }}>APIキーが未設定です。AI添削・問題生成が使えません。</div>}
+            </div>
+            <div style={{ ...cardStyle, marginTop: 14 }}>
+              <div style={labelStyle}>データについて</div>
+              <div style={{ fontSize: 12.5, color: "#5A5347", lineHeight: 1.8 }}>
+                学習履歴・進捗はこの端末のSafari内(localStorage)に保存されます。Safariの「履歴とWebサイトデータを消去」を行うと消えてしまうのでご注意ください。他の端末とは同期されません。
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const cardStyle = { background: "#FAF6EC", border: "1px solid #E7E0CE", borderRadius: 10, padding: "18px 20px", boxShadow: "0 1px 0 rgba(0,0,0,0.2)" };
+const labelStyle = { fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, letterSpacing: "0.06em", color: "#8A8478", textTransform: "uppercase", marginBottom: 10 };
+const errBox = { background: "#3A1E1B", color: "#F0B4AC", padding: "10px 14px", borderRadius: 6, fontSize: 13, marginBottom: 16 };
+function navBtn(active) {
+  return { background: "none", border: "none", cursor: "pointer", color: active ? "#C9A227" : "#8A8478", borderBottom: active ? "1.5px solid #C9A227" : "1.5px solid transparent", paddingBottom: 2, fontFamily: "'IBM Plex Mono', monospace" };
+}
+function primaryBtn(disabled) {
+  return { background: disabled ? "#7A342C" : "#B23A2E", color: "#FAF6EC", border: "none", borderRadius: 6, padding: "10px 18px", fontFamily: "'IBM Plex Mono', monospace", fontSize: 13, cursor: disabled ? "not-allowed" : "pointer", fontWeight: 600 };
+}
+const ghostBtn = { background: "none", border: "1px solid #C9A227", color: "#8A6F1E", borderRadius: 6, padding: "5px 10px", fontSize: 11.5, cursor: "pointer", fontFamily: "'IBM Plex Mono', monospace" };
+const ghostBtnWide = { ...ghostBtn, flex: 1, textAlign: "center", padding: "10px 0" };
+
+const rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(<App />);
+</script>
+</body>
+</html>
