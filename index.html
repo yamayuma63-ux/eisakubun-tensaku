@@ -655,12 +655,14 @@ ${ACTIVE_ERROR_TYPES.map(k => `${k}: ${ERROR_TYPE_TAXONOMY[k].label}`).join(" / 
 - 該当なし・正解の場合はnull`;
 
 // 発生源(sourceType)ごとの重要度。Weakness登録の対象はこのマップに存在するsourceTypeのみ。
+// review(Phase 8)は不正解時のみOccurrenceを追加する対象として、ここに追加する。
 const OCCURRENCE_SEVERITY = {
-  finalCheckRemedial: 4, finalCheck: 3, freeWriting: 3, weeklyRemedial: 3, weekly: 2, support: 1,
+  finalCheckRemedial: 4, finalCheck: 3, freeWriting: 3, weeklyRemedial: 3, weekly: 2, support: 1, review: 2,
 };
 const WEAKNESS_REGISTERED_SOURCE_TYPES = Object.keys(OCCURRENCE_SEVERITY);
 const WEAKNESS_MAX_COUNT = 200;
 const WEAKNESS_OCCURRENCE_CAP = 10;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 // errorPatternの正規化・validation。不正・過度に長い場合はnullを返し、呼び出し側でフォールバックさせる。
 function normalizeErrorPattern(raw) {
@@ -737,8 +739,10 @@ function registerWeaknessOccurrence(weaknesses, input) {
       occurrences: [occurrenceEntry],
       createdAt: nowIso,
       lastSeenAt: nowIso,
-      // Phase 8専用フィールド。Phase 7では初期化のみ行い、以後一切更新しない。
-      lastReviewedAt: null, nextReviewAt: null, reviewCount: 0, correctCount: 0, masteryLevel: 0,
+      // Phase 8: 新規WeaknessはSupportとSpaced Reviewを分離するため、初回Reviewを翌日以降にする
+      // (Phase 7時点でnullだった既存レコードはそのまま即due扱いとなり、後方互換を保つ)。
+      lastReviewedAt: null, nextReviewAt: new Date(Date.now() + MS_PER_DAY).toISOString(),
+      reviewCount: 0, correctCount: 0, masteryLevel: 0, recentReviewJapanese: [],
     };
     return pruneWeaknesses({ ...weaknesses, [weaknessId]: wk });
   }
@@ -787,6 +791,141 @@ async function recordWeaknessOccurrences(items) {
     const next = registerWeaknessOccurrences(current, items);
     await saveWeaknesses(next);
   } catch (e) { console.error("recordWeaknessOccurrences failed (non-fatal)", e); }
+}
+
+// ---------- Phase 8: REVIEW ENGINE (MASTER_SPEC PART 7) ----------
+// redpen:weaknesses(Phase 7)を唯一の真実源として再利用する。新規のトップレベルlocalStorageキーは作らない。
+// Today's Five/Support/週次演習/Final Checkとは完全に独立したセッション・関数群として実装する
+// (既存のTOPIC_BASED_ROUNDS/session/submitSession、topicProgress/lessonStates/Coverageには一切触れない)。
+
+const REVIEW_INTERVAL_DAYS = { 1: 1, 2: 3, 3: 7, 4: 14, 5: 30 }; // キー=到達後のmasteryLevel(1〜5)
+const REVIEW_BATCH_SIZE = 10; // 1セッションで生成する問題数の上限。dueの総数自体は切り捨てない
+
+function isWeaknessDue(weakness, nowTs) {
+  const now = nowTs || Date.now();
+  if (!weakness.nextReviewAt) return true; // Phase 7以前のnullは即due(後方互換)
+  return new Date(weakness.nextReviewAt).getTime() <= now;
+}
+
+// 優先度: 重要度・頻度・低習熟度・期限超過日数を単純に加減算するだけの決定的スコアリング(AIには一切問わない)。
+function computeReviewPriority(weakness, nowTs) {
+  const now = nowTs || Date.now();
+  const overdueDays = weakness.nextReviewAt
+    ? Math.max(0, (now - new Date(weakness.nextReviewAt).getTime()) / MS_PER_DAY)
+    : 999; // 未Review(null)は最優先
+  return (weakness.severity || 1) * 10 + Math.min(weakness.occurrenceCount || 1, 10) - (weakness.masteryLevel || 0) * 5 + overdueDays;
+}
+
+function getDueWeaknesses(weaknesses, nowTs) {
+  const now = nowTs || Date.now();
+  return Object.values(weaknesses)
+    .filter(w => isWeaknessDue(w, now))
+    .sort((a, b) => computeReviewPriority(b, now) - computeReviewPriority(a, now));
+}
+
+// その日のdue全件のうち、先頭REVIEW_BATCH_SIZE件を1バッチとして返す。totalDueは切り捨てず全件数を返す。
+function pickReviewBatch(weaknesses, nowTs) {
+  const due = getDueWeaknesses(weaknesses, nowTs);
+  return { batch: due.slice(0, REVIEW_BATCH_SIZE), totalDue: due.length };
+}
+
+// Reviewの不正解時専用。registerWeaknessOccurrence()のようなerrorType/errorPatternからのweaknessId
+// 再判定は一切行わない。Review開始時点で確定しているweaknessIdへ直接Occurrenceを追加するのみ。
+function appendOccurrenceToWeakness(weaknesses, weaknessId, occurrence) {
+  const existing = weaknesses[weaknessId];
+  if (!existing) return weaknesses; // 対象が既に存在しない場合は何もしない(安全側)
+  const occurrences = [...existing.occurrences, occurrence].slice(-WEAKNESS_OCCURRENCE_CAP);
+  const updated = {
+    ...existing,
+    occurrences,
+    occurrenceCount: existing.occurrenceCount + 1,
+    severity: Math.max(existing.severity, occurrence.severity),
+    sourceTypes: existing.sourceTypes.includes(occurrence.sourceType) ? existing.sourceTypes : [...existing.sourceTypes, occurrence.sourceType],
+    // lastSeenAt/nextReviewAt/masteryLevel等はここでは更新しない(直後にapplyReviewResultが確定させるため)
+  };
+  return { ...weaknesses, [weaknessId]: updated };
+}
+
+// 正解/不正解に応じてmasteryLevel/reviewCount/correctCount/nextReviewAt/lastReviewedAtを更新する。
+// 正解: masteryLevel+1(上限5)、REVIEW_INTERVAL_DAYS[newLevel]日後。不正解: masteryLevel-1(下限0)、翌日固定。
+function applyReviewResult(weakness, correct, nowTs) {
+  const now = nowTs || Date.now();
+  const nowIso = new Date(now).toISOString();
+  const reviewCount = (weakness.reviewCount || 0) + 1;
+  const correctCount = (weakness.correctCount || 0) + (correct ? 1 : 0);
+  let masteryLevel, nextReviewAt;
+  if (correct) {
+    masteryLevel = Math.min((weakness.masteryLevel || 0) + 1, 5);
+    const intervalDays = REVIEW_INTERVAL_DAYS[masteryLevel] || 1;
+    nextReviewAt = new Date(now + intervalDays * MS_PER_DAY).toISOString();
+  } else {
+    masteryLevel = Math.max((weakness.masteryLevel || 0) - 1, 0);
+    nextReviewAt = new Date(now + MS_PER_DAY).toISOString();
+  }
+  return { ...weakness, reviewCount, correctCount, masteryLevel, nextReviewAt, lastReviewedAt: nowIso };
+}
+
+// 1問のReview結果をWeakness DBへ反映する統括処理。
+// 処理順: (不正解時のみ)Occurrence追加 → reviewCount/correctCount更新 → masteryLevel更新 → nextReviewAtを確定
+// この順序により、Occurrence追加処理がnextReviewAtを上書きすることはない(applyReviewResultが最後に確定させる)。
+function processReviewAnswer(weaknesses, weaknessId, correct, occurrenceIfWrong, nowTs) {
+  let next = weaknesses;
+  if (!correct && occurrenceIfWrong) {
+    next = appendOccurrenceToWeakness(next, weaknessId, occurrenceIfWrong);
+  }
+  const current = next[weaknessId];
+  if (!current) return next; // 対象が消えていた場合は何もしない
+  const updated = applyReviewResult(current, correct, nowTs);
+  return { ...next, [weaknessId]: updated };
+}
+
+// カテゴリ別の問題形式(現状、AIが選択可能なerrorTypeは全てgrammar/usage/collocationのため
+// 実質的に全てTRANSLATIONで扱われる。PARAPHRASE/EXPANSION生成は未実装、テーブルのみ用意する)。
+const CATEGORY_QUESTION_FORMAT = {
+  grammar: "TRANSLATION", usage: "TRANSLATION", collocation: "TRANSLATION",
+  vocabulary: "PARAPHRASE", paraphrase: "PARAPHRASE",
+  logic: "EXPANSION", structure: "EXPANSION", cohesion: "EXPANSION",
+};
+
+// 復習問題の生成。各Weaknessの具体的な原因パターン(errorPattern/代表例文)を突く問題を作らせる。
+// 出力は elementId=weaknessId として、既存のgradeDrillAnswers/DrillSessionとそのまま整合させる。
+async function generateReviewProblems(weaknessItems) {
+  const avoidAll = weaknessItems.flatMap(w => w.recentReviewJapanese || []);
+  const avoidNote = avoidAll.length > 0
+    ? `\n以下の例文は直近の復習で使用済みのため、同じ文や酷似した文は避けてください:\n${avoidAll.join("\n")}`
+    : "";
+  const list = weaknessItems.map(w => {
+    const label = ERROR_TYPE_TAXONOMY[w.errorType] ? ERROR_TYPE_TAXONOMY[w.errorType].label : w.errorType;
+    return `${w.weaknessId}: ${label}${w.errorPattern ? "(" + w.errorPattern + ")" : ""} — 過去の誤り例: ${w.representativeOriginal || "なし"}`;
+  }).join("\n");
+  const sys = `あなたは復習問題の出題者です。以下は学習者が過去に間違えた具体的な弱点パターンのリストです(1行=1弱点)。
+各行のIDごとに1問ずつ、その弱点パターンを再度突く和文英訳問題を作成してください(単なる一般的な文法問題ではなく、記録された誤りの原因パターンに沿った状況設定にしてください)。${avoidNote}
+以下のJSON配列のみを出力してください。説明やコードフェンスは付けないでください。配列の要素数は入力行数と必ず一致させてください。
+[{"elementId": "対象のID(行頭のIDをそのまま使う)", "japanese": "和文問題文", "modelAnswer": "模範解答の英文"}]`;
+  const clean = await withRetry(() => callClaudeRaw(sys, list, 1600));
+  return JSON.parse(clean);
+}
+
+// AI生成失敗時のフォールバック。topicIdを持つWeaknessのみ対象とし、既存のFALLBACK_PROBLEMSから
+// 実在する例文を引く(偽のプレースホルダーは出さない)。topicIdを持たない項目が1つでもあれば例外を投げ、
+// 呼び出し側で明示的なエラー+再試行に倒す。
+function getFallbackReviewProblems(weaknessItems) {
+  const missingTopic = weaknessItems.some(w => !w.topicId || !TOPIC_MAP[w.topicId]);
+  if (missingTopic) {
+    throw new Error("review fallback unavailable: some weaknesses have no topicId");
+  }
+  const used = {};
+  return weaknessItems.map(w => {
+    const topic = TOPIC_MAP[w.topicId];
+    const pool = (FALLBACK_PROBLEMS[topic.lessonId] || []).filter(p => topic.sourceExamples.includes(p.japanese));
+    const avoid = w.recentReviewJapanese || [];
+    const fresh = pool.filter(p => !avoid.includes(p.japanese));
+    const bank = fresh.length > 0 ? fresh : pool;
+    if (bank.length === 0) throw new Error("review fallback unavailable: empty pool for topic " + w.topicId);
+    const idx = (used[w.weaknessId] || 0) % bank.length;
+    used[w.weaknessId] = (used[w.weaknessId] || 0) + 1;
+    return { elementId: w.weaknessId, japanese: bank[idx].japanese, modelAnswer: bank[idx].modelAnswer };
+  });
 }
 
 // ---------- Phase 3: INPUT Engine — Mini Lessons (MASTER_SPEC PART 4, §10-13) ----------
@@ -1411,9 +1550,10 @@ const ROUND_LABEL = {
   daily: "今日の5問", support: "補助問題(当日の理解補助)",
   remedial: "定着問題(前回の間違い対策)",
   weekly: "週次演習(10問)", weeklyRemedial: "定着問題(週次演習の間違い対策)",
+  review: "今日の復習",
 };
 
-function DrillSession({ session, onAnswerChange, onSubmit, onFinish, onSupport, loading }) {
+function DrillSession({ session, onAnswerChange, onSubmit, onFinish, onSupport, resultNote, onSecondaryAction, secondaryActionLabel, loading }) {
   const allAnswered = session.problems.every(p => (p.userAnswer || "").trim().length > 0);
   const labelFor = (id) => {
     const found = (session.classificationList || []).find(x => x.id === id);
@@ -1459,13 +1599,21 @@ function DrillSession({ session, onAnswerChange, onSubmit, onFinish, onSupport, 
           {loading ? "採点中..." : "採点する"}
         </button>
       ) : (
-        <div style={{ display: "flex", gap: 10 }}>
-          {canSupport && (
-            <button onClick={onSupport} disabled={loading} style={ghostBtnWide}>
-              {loading ? "準備中..." : "補助問題に進む"}
-            </button>
-          )}
-          <button onClick={onFinish} style={primaryBtn(false)}>完了</button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {resultNote && <div style={{ fontSize: 12.5, color: "#8A8478" }}>{resultNote}</div>}
+          <div style={{ display: "flex", gap: 10 }}>
+            {canSupport && (
+              <button onClick={onSupport} disabled={loading} style={ghostBtnWide}>
+                {loading ? "準備中..." : "補助問題に進む"}
+              </button>
+            )}
+            {onSecondaryAction && (
+              <button onClick={onSecondaryAction} disabled={loading} style={ghostBtnWide}>
+                {loading ? "準備中..." : secondaryActionLabel}
+              </button>
+            )}
+            <button onClick={onFinish} style={primaryBtn(false)}>完了</button>
+          </div>
         </div>
       )}
     </div>
@@ -1562,6 +1710,9 @@ function App() {
   const [drillReady, setDrillReady] = useState(false);
   // Phase 5: Final Check専用セッション(通常のsession/DrillSessionとは別に管理。10点方式のため)
   const [finalCheckSession, setFinalCheckSession] = useState(null);
+  // Phase 8: Review Engine専用のセッション・due件数(既存session/finalCheckSessionとは完全に独立)
+  const [reviewSession, setReviewSession] = useState(null);
+  const [weaknessDueCount, setWeaknessDueCount] = useState(0);
 
   // freewrite state
   const [freeWriteState, setFreeWriteState] = useState({ lastTs: null, usedThemes: [] });
@@ -1573,6 +1724,7 @@ function App() {
   useEffect(() => {
     if (view === "history") loadHistory();
     if (view === "drill" && !drillReady) loadDrillState();
+    if (view === "drill") refreshWeaknessDueCount();
     if (view === "freewrite" && !freeWriteReady) loadFreeWriteState();
   }, [view]);
 
@@ -1970,6 +2122,132 @@ function App() {
     await startRound("finalCheckRemedial", remedialTopics.map(topicToElement));
   }
 
+  // ---------- Phase 8: REVIEW ENGINE ----------
+  async function refreshWeaknessDueCount() {
+    try {
+      const weaknesses = await loadWeaknesses();
+      setWeaknessDueCount(getDueWeaknesses(weaknesses).length);
+    } catch (e) { console.error("refreshWeaknessDueCount failed", e); }
+  }
+
+  async function generateReviewBatchProblems(weaknessItems, classificationList, totalDue) {
+    setDrillError("");
+    setDrillWarning("");
+    setDrillLoading(true);
+    try {
+      const probs = await generateReviewProblems(weaknessItems);
+      if (!Array.isArray(probs) || probs.length !== weaknessItems.length) {
+        throw new Error("review problem count mismatch: expected " + weaknessItems.length + ", got " + (probs && probs.length));
+      }
+      const problems = probs.map(p => ({ ...p, userAnswer: "" }));
+      setReviewSession({ round: "review", stage: "answering", problems, usedFallback: false, classificationList, totalDueAtStart: totalDue, weaknessItems });
+    } catch (e) {
+      console.error("generateReviewProblems failed, trying fallback", e);
+      try {
+        const problems = getFallbackReviewProblems(weaknessItems).map(p => ({ ...p, userAnswer: "" }));
+        setReviewSession({ round: "review", stage: "answering", problems, usedFallback: true, classificationList, totalDueAtStart: totalDue, weaknessItems });
+        setDrillWarning("AIによる問題生成が一時的にできなかったため、予備の問題セットを表示しています。");
+      } catch (fallbackErr) {
+        // 偽のフォールバックは出さない。バッチ(weaknessItems)は保持したまま、明示的エラー+再試行のみ提示する。
+        console.error("review fallback unavailable", fallbackErr);
+        setReviewSession({ round: "review", stage: "generation-error", problems: [], usedFallback: false, classificationList, totalDueAtStart: totalDue, weaknessItems });
+        setDrillError("復習問題の生成に失敗しました。もう一度お試しください。");
+      }
+    }
+    setDrillLoading(false);
+  }
+
+  async function retryReviewGeneration() {
+    if (!reviewSession) return;
+    await generateReviewBatchProblems(reviewSession.weaknessItems, reviewSession.classificationList, reviewSession.totalDueAtStart);
+  }
+
+  async function startReviewBatch() {
+    setDrillError("");
+    setDrillLoading(true);
+    let weaknesses;
+    try {
+      weaknesses = await loadWeaknesses();
+    } catch (e) {
+      setDrillError("復習データの読み込みに失敗しました。もう一度お試しください。");
+      setDrillLoading(false);
+      return;
+    }
+    const { batch, totalDue } = pickReviewBatch(weaknesses);
+    setDrillLoading(false);
+    if (batch.length === 0) { setReviewSession(null); return; }
+    const weaknessItems = batch.map(w => ({
+      weaknessId: w.weaknessId, topicId: w.topicId, lessonId: w.lessonId,
+      errorType: w.errorType, errorPattern: w.errorPattern,
+      representativeOriginal: w.representativeOriginal,
+      recentReviewJapanese: w.recentReviewJapanese || [],
+    }));
+    const classificationList = batch.map(w => ({
+      id: w.weaknessId,
+      label: (ERROR_TYPE_TAXONOMY[w.errorType] ? ERROR_TYPE_TAXONOMY[w.errorType].label : w.errorType) + (w.errorPattern ? "(" + w.errorPattern + ")" : ""),
+    }));
+    await generateReviewBatchProblems(weaknessItems, classificationList, totalDue);
+  }
+
+  function updateReviewAnswer(i, val) {
+    setReviewSession(s => {
+      const problems = s.problems.slice();
+      problems[i] = { ...problems[i], userAnswer: val };
+      return { ...s, problems };
+    });
+  }
+
+  async function submitReviewAnswers() {
+    setDrillLoading(true);
+    setDrillError("");
+    try {
+      const graded = await gradeDrillAnswers(reviewSession.problems, reviewSession.classificationList);
+      if (!Array.isArray(graded) || graded.length !== reviewSession.problems.length) {
+        throw new Error("review grading count mismatch: expected " + reviewSession.problems.length + ", got " + (graded && graded.length));
+      }
+      const problems = reviewSession.problems.map((p, i) => ({
+        ...p, correct: graded[i].correct, correctedText: graded[i].correctedText, feedback: graded[i].feedback,
+      }));
+
+      // Weakness更新: identityの再判定は行わない。Review開始時点で確定済みのweaknessId(=p.elementId)へ直接反映する。
+      let weaknesses = await loadWeaknesses();
+      const nowTs = Date.now();
+      problems.forEach(p => {
+        const weaknessId = p.elementId;
+        const target = weaknesses[weaknessId];
+        const occurrence = (!p.correct && target) ? {
+          ts: nowTs, sourceType: "review", severity: OCCURRENCE_SEVERITY.review || 2,
+          topicId: target.topicId || null, lessonId: target.lessonId || null,
+          originalSentence: p.japanese, correctedSentence: p.correctedText, explanation: p.feedback,
+        } : null;
+        // 処理順: (不正解時)Occurrence追加 → reviewCount/correctCount更新 → masteryLevel更新 → nextReviewAt確定
+        weaknesses = processReviewAnswer(weaknesses, weaknessId, p.correct, occurrence, nowTs);
+        if (weaknesses[weaknessId]) {
+          const cur = weaknesses[weaknessId];
+          const recent = [...(cur.recentReviewJapanese || []), p.japanese].slice(-5);
+          weaknesses = { ...weaknesses, [weaknessId]: { ...cur, recentReviewJapanese: recent } };
+        }
+      });
+      await saveWeaknesses(weaknesses);
+
+      const remainingDue = getDueWeaknesses(weaknesses).length;
+      setReviewSession({ ...reviewSession, stage: "result", problems, remainingDue });
+      setWeaknessDueCount(remainingDue);
+    } catch (e) {
+      setDrillError("採点に失敗しました。もう一度お試しください。");
+    }
+    setDrillLoading(false);
+  }
+
+  function finishReview() {
+    setReviewSession(null);
+    refreshWeaknessDueCount();
+  }
+
+  async function startNextReviewBatch() {
+    await startReviewBatch();
+  }
+
   function updateAnswer(i, val) {
     setSession(s => {
       const problems = s.problems.slice();
@@ -2201,7 +2479,7 @@ function App() {
                 <button onClick={() => saveDrillState(drillState)} style={{ ...ghostBtn, whiteSpace: "nowrap" }}>今すぐ再送信</button>
               </div>
             )}
-            {!session && !finalCheckSession && (() => {
+            {!session && !finalCheckSession && !reviewSession && (() => {
               const lesson = LESSON_MAP[drillState.currentLessonId];
               const lessonState = lesson && drillState.lessonStates && drillState.lessonStates[lesson.lessonId];
               const status = lessonState ? lessonState.status : LESSON_STATUS.LEARNING;
@@ -2238,6 +2516,11 @@ function App() {
                   <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
                     <button onClick={startDaily} disabled={drillLoading || todayBlocked} style={primaryBtn(drillLoading || todayBlocked)}>{drillLoading ? "準備中..." : "今日の5問"}</button>
                     <button onClick={startWeekly} disabled={drillLoading || Object.keys(drillState.elementStats).length === 0} style={ghostBtnWide}>週次演習(10問)</button>
+                  </div>
+                  <div style={{ marginBottom: 14 }}>
+                    <button onClick={startReviewBatch} disabled={drillLoading || weaknessDueCount === 0} style={ghostBtnWide}>
+                      {drillLoading ? "準備中..." : `今日の復習(${weaknessDueCount}件)`}
+                    </button>
                   </div>
                   {(isLearningComplete || isRemedial) && (
                     <div style={{ marginBottom: 14 }}>
@@ -2293,6 +2576,26 @@ function App() {
                 onSubmit={submitFinalCheckAnswers}
                 onFinish={finishFinalCheck}
                 onRemedial={startFinalCheckRemedial}
+                loading={drillLoading}
+              />
+            )}
+            {reviewSession && (
+              <DrillSession
+                session={reviewSession}
+                onAnswerChange={updateReviewAnswer}
+                onSubmit={submitReviewAnswers}
+                onFinish={finishReview}
+                resultNote={
+                  reviewSession.stage === "result" ? `残りdue: ${reviewSession.remainingDue}件`
+                    : reviewSession.stage === "generation-error" ? "問題の生成に失敗しました。"
+                    : undefined
+                }
+                onSecondaryAction={
+                  reviewSession.stage === "result" && reviewSession.remainingDue > 0 ? startNextReviewBatch
+                    : reviewSession.stage === "generation-error" ? retryReviewGeneration
+                    : undefined
+                }
+                secondaryActionLabel={reviewSession.stage === "result" ? "次のバッチへ進む" : "再試行"}
                 loading={drillLoading}
               />
             )}
